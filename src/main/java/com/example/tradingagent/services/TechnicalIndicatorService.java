@@ -26,7 +26,8 @@ public class TechnicalIndicatorService {
 
     private static final Logger logger = LoggerFactory.getLogger(TechnicalIndicatorService.class);
 
-    public Map<String, Double> calculateIndicators(List<HistoricCandle> candles) {
+    // Добавил ticker и figi для логирования
+    public Map<String, Double> calculateIndicators(List<HistoricCandle> candles, String ticker, String figi) {
         Map<String, Double> indicators = new HashMap<>();
         if (candles == null || candles.size() < 120) {
             return indicators;
@@ -54,8 +55,7 @@ public class TechnicalIndicatorService {
 
             // RSI
             RSIIndicator rsi = new RSIIndicator(closePrice, 14);
-            double rsiValue = rsi.getValue(lastIndex).doubleValue();
-            indicators.put("rsi_14", rsiValue);
+            indicators.put("rsi_14", rsi.getValue(lastIndex).doubleValue());
             indicators.put("rsi_14_previous", rsi.getValue(lastIndex - 1).doubleValue());
 
             // MACD
@@ -65,28 +65,26 @@ public class TechnicalIndicatorService {
             indicators.put("macd_hist", macdHist);
             indicators.put("macd_hist_previous", macd.getValue(lastIndex - 1).doubleValue() - macdSignal.getValue(lastIndex - 1).doubleValue());
 
-            // ATR
+            // ATR (Волатильность)
             ATRIndicator atr = new ATRIndicator(series, 14);
             double atrValue = atr.getValue(lastIndex).doubleValue();
             indicators.put("atr_14", atrValue);
 
             // EMA & Price
             EMAIndicator ema100 = new EMAIndicator(closePrice, 100);
-            double emaValue = ema100.getValue(lastIndex).doubleValue();
-            double priceValue = closePrice.getValue(lastIndex).doubleValue();
-            indicators.put("ema_100", emaValue);
-            indicators.put("current_price", priceValue);
+            indicators.put("ema_100", ema100.getValue(lastIndex).doubleValue());
+            double currentPrice = closePrice.getValue(lastIndex).doubleValue();
+            indicators.put("current_price", currentPrice);
 
-            // ADX
+            // ADX (Сила тренда)
             ADXIndicator adx = new ADXIndicator(series, 14);
             double adxValue = adx.getValue(lastIndex).doubleValue();
             indicators.put("adx_14", adxValue);
 
-            // Логирование критических значений для отладки стратегии
-            // Если ADX низкий, но сигнал идет - это причина убытков во флэте
-             logger.info("Calculated Ind: Price={}, EMA={}, MACD_Hist={}, ADX={}, ATR={}",
-                    String.format("%.2f", priceValue), String.format("%.2f", emaValue),
-                    String.format("%.4f", macdHist), String.format("%.2f", adxValue), String.format("%.2f", atrValue));
+            // ИСПРАВЛЕННОЕ ЛОГИРОВАНИЕ
+            String logMessage = String.format("CALC IND [%s]: Price=%.2f, ADX=%.1f, ATR=%.2f, MACD_Hist=%.4f",
+                    ticker, currentPrice, adxValue, atrValue, macdHist);
+            logger.info(logMessage);
 
         } catch (Exception e) {
             logger.error("Ошибка расчета индикаторов: ", e);

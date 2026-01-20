@@ -11,43 +11,33 @@ import org.springframework.web.bind.annotation.*;
 import ru.tinkoff.piapi.contract.v1.CandleInterval;
 import ru.tinkoff.piapi.contract.v1.GetOrderBookResponse;
 import ru.tinkoff.piapi.contract.v1.HistoricCandle;
-import ru.tinkoff.piapi.contract.v1.Instrument;
 import ru.tinkoff.piapi.contract.v1.Share;
 import ru.tinkoff.piapi.core.InvestApi;
+import ru.tinkoff.piapi.core.models.Portfolio;
+import ru.tinkoff.piapi.core.models.Position;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 
 @RestController
 @RequestMapping("/api")
 public class MarketDataController {
 
+    private static final BigDecimal MIN_TURNOVER_RUB = new BigDecimal("5000000");
+    private static final double MIN_ADX_THRESHOLD = 25.0;
+    private static final BigDecimal DAILY_LOSS_LIMIT = new BigDecimal("3000.00");
     private final TinkoffMarketDataService marketDataService;
     private final TechnicalIndicatorService indicatorService;
     private final TinkoffOrderService orderService;
     private final TinkoffInstrumentsService instrumentsService;
     private final NewsService newsService;
-    private final RiskManagementService riskManagementService;
+    private final TinkoffAccountService accountService;
     private final InvestApi api;
-
-    private static final BigDecimal MIN_TURNOVER_RUB = new BigDecimal("5000000");
-    private static final double MIN_ADX_THRESHOLD = 20.0;
-
     // Circuit Breaker
-    private BigDecimal dailyLoss = BigDecimal.ZERO;
-    private static final BigDecimal DAILY_LOSS_LIMIT = new BigDecimal("3000.00");
-
-    private void log(String msg) {
-        System.out.println("[CONTROLLER " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] " + msg);
-    }
+    private final BigDecimal dailyLoss = BigDecimal.ZERO;
 
     @Autowired
     public MarketDataController(TinkoffMarketDataService marketDataService,
@@ -55,57 +45,88 @@ public class MarketDataController {
                                 TinkoffOrderService orderService,
                                 TinkoffInstrumentsService instrumentsService,
                                 NewsService newsService,
-                                RiskManagementService riskManagementService) {
+                                TinkoffAccountService accountService) {
         this.marketDataService = marketDataService;
         this.indicatorService = indicatorService;
         this.orderService = orderService;
         this.instrumentsService = instrumentsService;
         this.newsService = newsService;
-        this.riskManagementService = riskManagementService;
+        this.accountService = accountService;
         this.api = TinkoffApi.getApi();
+    }
+
+    private void log(String msg) {
+        System.out.println("[SCANNER " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] " + msg);
     }
 
     @GetMapping("/scan-market")
     public ResponseEntity<?> scanMarket(
             @RequestParam(name = "to", required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Optional<Instant> to) {
 
-        log("Запуск сканирования рынка...");
+        log("--- СТАРТ СКАНИРОВАНИЯ ---");
         Instant effectiveTimeTo = to.orElse(Instant.now());
         List<Share> shares = instrumentsService.getBlueChips();
         List<Map<String, Object>> marketData = new ArrayList<>();
 
+        // 1. Получаем список FIGI, которые уже есть в портфеле (чтобы их не скипать)
+        Set<String> portfolioFigis = new HashSet<>();
+        try {
+            Portfolio portfolio = api.getOperationsService().getPortfolioSync(accountService.getSandboxAccountId());
+            for (Position p : portfolio.getPositions()) {
+                if (p.getQuantity().compareTo(BigDecimal.ZERO) != 0) {
+                    portfolioFigis.add(p.getFigi());
+                }
+            }
+            if (!portfolioFigis.isEmpty()) {
+                log("Активные позиции в портфеле: " + portfolioFigis.size() + " шт. Проверка вне очереди.");
+            }
+        } catch (Exception e) {
+            System.err.println("Ошибка получения портфеля: " + e.getMessage());
+        }
+
         int daysToRequestH1 = 30;
         int daysToRequestM15 = 7;
 
+        int skippedTurnover = 0;
+        int skippedAdx = 0;
+
         for (Share share : shares) {
             try {
-                // 1. Фильтр оборота
+                boolean hasPosition = portfolioFigis.contains(share.getFigi());
+
+                // 2. Получаем данные
                 List<HistoricCandle> candlesH1 = marketDataService.getHistoricCandles(share.getFigi(), daysToRequestH1, CandleInterval.CANDLE_INTERVAL_HOUR, effectiveTimeTo);
                 if (candlesH1.isEmpty()) continue;
 
-                HistoricCandle lastH1 = candlesH1.get(candlesH1.size() - 1);
-                BigDecimal closeH1 = TinkoffApiUtils.quotationToBigDecimal(lastH1.getClose());
-                BigDecimal volumeH1 = BigDecimal.valueOf(lastH1.getVolume());
-                BigDecimal turnover = closeH1.multiply(volumeH1);
+                // --- ФИЛЬТРЫ (Применяем, только если НЕТ позиции) ---
+                if (!hasPosition) {
+                    HistoricCandle lastH1 = candlesH1.getLast();
+                    BigDecimal closeH1 = TinkoffApiUtils.quotationToBigDecimal(lastH1.getClose());
+                    BigDecimal volumeH1 = BigDecimal.valueOf(lastH1.getVolume());
+                    BigDecimal turnover = closeH1.multiply(volumeH1);
 
-                if (turnover.compareTo(MIN_TURNOVER_RUB) < 0) {
-                    continue;
+                    if (turnover.compareTo(MIN_TURNOVER_RUB) < 0) {
+                        skippedTurnover++;
+                        continue;
+                    }
                 }
 
-                // 2. Расчет индикаторов
                 List<HistoricCandle> candlesM15 = marketDataService.getHistoricCandles(share.getFigi(), daysToRequestM15, CandleInterval.CANDLE_INTERVAL_15_MIN, effectiveTimeTo);
                 if (candlesM15.isEmpty()) continue;
 
-                Map<String, Double> indicatorsH1 = indicatorService.calculateIndicators(candlesH1);
-                Map<String, Double> indicatorsM15 = indicatorService.calculateIndicators(candlesM15);
+                // Передаем ticker и figi для логирования
+                Map<String, Double> indicatorsH1 = indicatorService.calculateIndicators(candlesH1, share.getTicker(), share.getFigi());
+                Map<String, Double> indicatorsM15 = indicatorService.calculateIndicators(candlesM15, share.getTicker(), share.getFigi());
 
                 if (indicatorsH1.isEmpty() || indicatorsM15.isEmpty()) continue;
 
-                // 3. Предварительный фильтр ADX (чтобы не спамить n8n мусором)
-                double adx = indicatorsH1.getOrDefault("adx_14", 0.0);
-                // Логируем только интересные ситуации, чтобы не забивать консоль
-                if (adx > 25) {
-                     log("Кандидат " + share.getTicker() + ": ADX=" + String.format("%.1f", adx) + ", MACD_Hist=" + String.format("%.2f", indicatorsM15.get("macd_hist")));
+                // --- ФИЛЬТР ADX (Только для новых входов) ---
+                if (!hasPosition) {
+                    double adx = indicatorsH1.getOrDefault("adx_14", 0.0);
+                    if (adx < MIN_ADX_THRESHOLD) {
+                        skippedAdx++;
+                        continue;
+                    }
                 }
 
                 Map<String, Object> instrumentData = new HashMap<>();
@@ -130,7 +151,7 @@ public class MarketDataController {
                 System.err.println("Ошибка при анализе " + share.getTicker() + ": " + e.getMessage());
             }
         }
-        log("Сканирование завершено. Найдено " + marketData.size() + " инструментов для анализа в n8n.");
+        log(String.format("Итоги: %d тикеров -> n8n. Скип: %d (объем), %d (ADX).", marketData.size(), skippedTurnover, skippedAdx));
         return ResponseEntity.ok(marketData);
     }
 
@@ -139,11 +160,15 @@ public class MarketDataController {
                                           @RequestParam(name = "simulate", defaultValue = "false") boolean simulate,
                                           @RequestParam(name = "to", required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Optional<Instant> to) {
         try {
-            log(">>> ВХОДЯЩИЙ ЗАПРОС ОТ n8n: " + tradeRequest.getAction() + " по " + tradeRequest.getTicker() + " (Score: " + tradeRequest.getConfidenceScore() + ")");
-            log("Причина: " + tradeRequest.getReason());
+            log("<<< СИГНАЛ n8n: " + tradeRequest.getAction() + " | " + tradeRequest.getTicker() +
+                    " | Score: " + tradeRequest.getConfidenceScore());
+
+            if (tradeRequest.getReason() != null) {
+                 log("Reason: " + tradeRequest.getReason());
+            }
 
             if (dailyLoss.compareTo(DAILY_LOSS_LIMIT) >= 0) {
-                log("ОТКАЗ: Превышен дневной лимит убытка.");
+                log("BLOCK: Дневной лимит убытка превышен!");
                 return ResponseEntity.badRequest().body("Торговля остановлена: превышен дневной лимит убытка.");
             }
 
@@ -152,17 +177,10 @@ public class MarketDataController {
 
             if (candles.isEmpty()) return ResponseEntity.badRequest().body("Нет данных");
 
-            Map<String, Double> indicators = indicatorService.calculateIndicators(candles);
-
-            // Фильтр ADX - проверка "на входе"
-            double adx = indicators.getOrDefault("adx_14", 0.0);
-            if (adx < MIN_ADX_THRESHOLD) {
-                log("ОТКАЗ: ADX упал (" + adx + ") пока сигнал шел от n8n.");
-                return ResponseEntity.ok().body("Сигнал пропущен: ADX " + adx + " < " + MIN_ADX_THRESHOLD);
-            }
+            // Вызов индикаторов обновлен
+            Map<String, Double> indicators = indicatorService.calculateIndicators(candles, tradeRequest.getTicker(), tradeRequest.getInstrumentFigi());
 
             if (simulate) {
-                // Симуляция отключена для краткости в этом примере
                 return ResponseEntity.ok().body("Simulation mode");
             } else {
                 orderService.executeTrade(tradeRequest, indicators);

@@ -3,7 +3,6 @@ package com.example.tradingagent.services;
 import com.example.tradingagent.TinkoffApi;
 import com.example.tradingagent.TinkoffApiUtils;
 import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import ru.tinkoff.piapi.contract.v1.Operation;
@@ -19,7 +18,6 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -113,7 +111,7 @@ public class TinkoffReportService {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
 
             CellStyle headerStyle = createHeaderStyle(workbook);
-            CellStyle currencyStyle = createCurrencyStyle(workbook, false);
+            CellStyle currencyStyle = createCurrencyStyle(workbook);
             CellStyle profitStyle = createCurrencyStyle(workbook, false, IndexedColors.GREEN.getIndex());
             CellStyle lossStyle = createCurrencyStyle(workbook, false, IndexedColors.RED.getIndex());
             CellStyle boldStyle = createBoldStyle(workbook);
@@ -159,8 +157,7 @@ public class TinkoffReportService {
                 for (ReportItem item : dailyItems) {
                     Row row = sheet.createRow(rowIdx++);
 
-                    if (item instanceof ClosedTrade) {
-                        ClosedTrade t = (ClosedTrade) item;
+                    if (item instanceof ClosedTrade t) {
                         updateStats(dailyStats, t);
 
                         row.createCell(0).setCellValue(dateTimeFmt.format(t.closeTime));
@@ -178,8 +175,7 @@ public class TinkoffReportService {
                         resCell.setCellValue(t.resultType);
                         resCell.setCellStyle(pnlStyle);
 
-                    } else if (item instanceof StandaloneFee) {
-                        StandaloneFee f = (StandaloneFee) item;
+                    } else if (item instanceof StandaloneFee f) {
                         updateStats(dailyStats, f);
 
                         row.createCell(0).setCellValue(dateTimeFmt.format(f.time));
@@ -290,8 +286,7 @@ public class TinkoffReportService {
     }
 
     private void updateStats(Stats stats, ReportItem item) {
-        if (item instanceof ClosedTrade) {
-            ClosedTrade t = (ClosedTrade) item;
+        if (item instanceof ClosedTrade t) {
             stats.totalTrades++;
             if (t.netPnL.compareTo(BigDecimal.ZERO) > 0) {
                 stats.profitableTrades++;
@@ -302,8 +297,7 @@ public class TinkoffReportService {
             }
             stats.totalNetPnL = stats.totalNetPnL.add(t.netPnL);
             stats.tradingCommission = stats.tradingCommission.add(t.totalCommission);
-        } else if (item instanceof StandaloneFee) {
-            StandaloneFee f = (StandaloneFee) item;
+        } else if (item instanceof StandaloneFee f) {
             stats.marginCommission = stats.marginCommission.add(f.amount.abs());
             stats.totalNetPnL = stats.totalNetPnL.add(f.amount); // amount отрицательный
         }
@@ -459,10 +453,6 @@ public class TinkoffReportService {
         CellStyle style = wb.createCellStyle(); Font font = wb.createFont(); font.setBold(true); style.setFont(font); return style;
     }
 
-    private CellStyle createDateStyle(Workbook wb) {
-        CellStyle style = wb.createCellStyle(); style.setAlignment(HorizontalAlignment.LEFT); return style;
-    }
-
     private CellStyle createCurrencyStyle(Workbook wb, boolean isRed, short colorIndex) {
         CellStyle style = wb.createCellStyle(); DataFormat format = wb.createDataFormat();
         style.setDataFormat(format.getFormat("#,##0.00"));
@@ -472,5 +462,5 @@ public class TinkoffReportService {
         return style;
     }
 
-    private CellStyle createCurrencyStyle(Workbook wb, boolean isRed) { return createCurrencyStyle(wb, isRed, (short)0); }
+    private CellStyle createCurrencyStyle(Workbook wb) { return createCurrencyStyle(wb, false, (short)0); }
 }

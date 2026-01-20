@@ -5,7 +5,6 @@ import org.springframework.stereotype.Service;
 import ru.tinkoff.piapi.contract.v1.CandleInterval;
 import ru.tinkoff.piapi.contract.v1.GetOrderBookResponse;
 import ru.tinkoff.piapi.contract.v1.HistoricCandle;
-import ru.tinkoff.piapi.contract.v1.OrderBook;
 import ru.tinkoff.piapi.core.InvestApi;
 
 import java.time.Instant;
