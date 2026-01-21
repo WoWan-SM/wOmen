@@ -26,6 +26,8 @@ public class TinkoffMarketDataService {
 
     /**
      * Получает исторические свечи для указанного инструмента.
+     * ИСПРАВЛЕНО: Увеличена история свечей для предотвращения NaN в индикаторах.
+     * Для индикаторов с периодом 14 требуется минимум 28-50 свечей, берем запас N*3.
      *
      * @param instrumentFigi FIGI (Financial Instrument Global Identifier) инструмента.
      * @param days           Количество прошедших дней, за которые нужно получить данные.
@@ -33,7 +35,10 @@ public class TinkoffMarketDataService {
      * @return Список объектов HistoricCandle.
      */
     public List<HistoricCandle> getHistoricCandles(String instrumentFigi, int days, CandleInterval interval, Instant to) {
-        Instant from = to.minus(days, ChronoUnit.DAYS);
+        // Увеличиваем количество дней в 3 раза для достаточного количества свечей
+        // Индикаторы ADX/EMA требуют "разгона", минимум 28-50 свечей при периоде 14
+        int extendedDays = Math.max(days * 3, 15); // Минимум 60 дней для надежности
+        Instant from = to.minus(extendedDays, ChronoUnit.DAYS);
 
         try {
             // Используем синхронный вызов для простоты

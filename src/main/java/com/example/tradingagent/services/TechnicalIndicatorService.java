@@ -30,6 +30,7 @@ public class TechnicalIndicatorService {
     public Map<String, Double> calculateIndicators(List<HistoricCandle> candles, String ticker, String figi) {
         Map<String, Double> indicators = new HashMap<>();
         if (candles == null || candles.size() < 120) {
+            logger.warn("Недостаточно свечей для расчета индикаторов: {} (требуется минимум 120)", candles == null ? 0 : candles.size());
             return indicators;
         }
 
@@ -55,39 +56,75 @@ public class TechnicalIndicatorService {
 
             // RSI
             RSIIndicator rsi = new RSIIndicator(closePrice, 14);
-            indicators.put("rsi_14", rsi.getValue(lastIndex).doubleValue());
-            indicators.put("rsi_14_previous", rsi.getValue(lastIndex - 1).doubleValue());
+            double rsiValue = rsi.getValue(lastIndex).doubleValue();
+            double rsiPrevious = rsi.getValue(lastIndex - 1).doubleValue();
+            
+            // ВАЛИДАЦИЯ: Проверка на NaN, Infinity или невалидные значения
+            if (Double.isNaN(rsiValue) || Double.isInfinite(rsiValue) || rsiValue <= 0 || rsiValue >= 100) {
+                logger.error("Невалидный RSI для {}: {}", ticker, rsiValue);
+                return indicators; // Возвращаем пустую карту
+            }
+            indicators.put("rsi_14", rsiValue);
+            indicators.put("rsi_14_previous", rsiPrevious);
 
             // MACD
             MACDIndicator macd = new MACDIndicator(closePrice, 12, 26);
             EMAIndicator macdSignal = new EMAIndicator(macd, 9);
             double macdHist = macd.getValue(lastIndex).doubleValue() - macdSignal.getValue(lastIndex).doubleValue();
+            double macdHistPrevious = macd.getValue(lastIndex - 1).doubleValue() - macdSignal.getValue(lastIndex - 1).doubleValue();
+            
+            if (Double.isNaN(macdHist) || Double.isInfinite(macdHist)) {
+                logger.error("Невалидный MACD для {}: {}", ticker, macdHist);
+                return indicators;
+            }
             indicators.put("macd_hist", macdHist);
-            indicators.put("macd_hist_previous", macd.getValue(lastIndex - 1).doubleValue() - macdSignal.getValue(lastIndex - 1).doubleValue());
+            indicators.put("macd_hist_previous", macdHistPrevious);
 
             // ATR (Волатильность)
             ATRIndicator atr = new ATRIndicator(series, 14);
             double atrValue = atr.getValue(lastIndex).doubleValue();
+            
+            if (Double.isNaN(atrValue) || Double.isInfinite(atrValue) || atrValue <= 0) {
+                logger.error("Невалидный ATR для {}: {}", ticker, atrValue);
+                return indicators;
+            }
             indicators.put("atr_14", atrValue);
 
             // EMA & Price
             EMAIndicator ema100 = new EMAIndicator(closePrice, 100);
-            indicators.put("ema_100", ema100.getValue(lastIndex).doubleValue());
+            double emaValue = ema100.getValue(lastIndex).doubleValue();
             double currentPrice = closePrice.getValue(lastIndex).doubleValue();
+            
+            if (Double.isNaN(currentPrice) || Double.isInfinite(currentPrice) || currentPrice <= 0) {
+                logger.error("Невалидная цена для {}: {}", ticker, currentPrice);
+                return indicators;
+            }
+            if (Double.isNaN(emaValue) || Double.isInfinite(emaValue)) {
+                logger.warn("EMA100 NaN для {}, но продолжаем", ticker);
+                // EMA может быть NaN на начальных периодах, но это не критично
+            } else {
+                indicators.put("ema_100", emaValue);
+            }
             indicators.put("current_price", currentPrice);
 
             // ADX (Сила тренда)
             ADXIndicator adx = new ADXIndicator(series, 14);
             double adxValue = adx.getValue(lastIndex).doubleValue();
+            
+            // ВАЛИДАЦИЯ ADX: критически важный индикатор
+            if (Double.isNaN(adxValue) || Double.isInfinite(adxValue) || adxValue < 0 || adxValue > 100) {
+                logger.error("Невалидный ADX для {}: {} (NaN означает недостаточное количество свечей)", ticker, adxValue);
+                return indicators; // Запрещаем торговлю при NaN в ADX
+            }
             indicators.put("adx_14", adxValue);
 
-            // ИСПРАВЛЕННОЕ ЛОГИРОВАНИЕ
+            // ЛОГИРОВАНИЕ
             String logMessage = String.format("CALC IND [%s]: Price=%.2f, ADX=%.1f, ATR=%.2f, MACD_Hist=%.4f",
                     ticker, currentPrice, adxValue, atrValue, macdHist);
             logger.info(logMessage);
 
         } catch (Exception e) {
-            logger.error("Ошибка расчета индикаторов: ", e);
+            logger.error("Ошибка расчета индикаторов для {}: ", ticker, e);
         }
 
         return indicators;

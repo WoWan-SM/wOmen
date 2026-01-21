@@ -3,6 +3,7 @@ package com.example.tradingagent.controllers;
 import com.example.tradingagent.TinkoffApi;
 import com.example.tradingagent.TinkoffApiUtils;
 import com.example.tradingagent.dto.TradeRequest;
+import com.example.tradingagent.entities.TradeDecision;
 import com.example.tradingagent.services.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -26,7 +27,8 @@ import java.util.*;
 @RequestMapping("/api")
 public class MarketDataController {
 
-    private static final BigDecimal MIN_TURNOVER_RUB = new BigDecimal("5000000");
+    private static final BigDecimal MIN_TURNOVER_RUB = new BigDecimal("500000");
+    // Фильтр "Пилы" (Choppy Market): ADX < 25 запрещает вход по трендовым стратегиям
     private static final double MIN_ADX_THRESHOLD = 25.0;
     private static final BigDecimal DAILY_LOSS_LIMIT = new BigDecimal("3000.00");
     private final TinkoffMarketDataService marketDataService;
@@ -35,6 +37,8 @@ public class MarketDataController {
     private final TinkoffInstrumentsService instrumentsService;
     private final NewsService newsService;
     private final TinkoffAccountService accountService;
+    private final AuditService auditService;
+    private final TradingStateMachine stateMachine;
     private final InvestApi api;
     // Circuit Breaker
     private final BigDecimal dailyLoss = BigDecimal.ZERO;
@@ -45,13 +49,17 @@ public class MarketDataController {
                                 TinkoffOrderService orderService,
                                 TinkoffInstrumentsService instrumentsService,
                                 NewsService newsService,
-                                TinkoffAccountService accountService) {
+                                TinkoffAccountService accountService,
+                                AuditService auditService,
+                                TradingStateMachine stateMachine) {
         this.marketDataService = marketDataService;
         this.indicatorService = indicatorService;
         this.orderService = orderService;
         this.instrumentsService = instrumentsService;
         this.newsService = newsService;
         this.accountService = accountService;
+        this.auditService = auditService;
+        this.stateMachine = stateMachine;
         this.api = TinkoffApi.getApi();
     }
 
@@ -85,7 +93,7 @@ public class MarketDataController {
         }
 
         int daysToRequestH1 = 30;
-        int daysToRequestM15 = 7;
+        int daysToRequestM15 = 1;
 
         int skippedTurnover = 0;
         int skippedAdx = 0;
@@ -118,15 +126,49 @@ public class MarketDataController {
                 Map<String, Double> indicatorsH1 = indicatorService.calculateIndicators(candlesH1, share.getTicker(), share.getFigi());
                 Map<String, Double> indicatorsM15 = indicatorService.calculateIndicators(candlesM15, share.getTicker(), share.getFigi());
 
-                if (indicatorsH1.isEmpty() || indicatorsM15.isEmpty()) continue;
+                if (indicatorsH1.isEmpty() || indicatorsM15.isEmpty()) {
+                    // ЛОГИРОВАНИЕ: Недостаточно данных
+                    HistoricCandle lastCandle = candlesH1.isEmpty() ? candlesM15.getLast() : candlesH1.getLast();
+                    BigDecimal priceClose = TinkoffApiUtils.quotationToBigDecimal(lastCandle.getClose());
+                    com.example.tradingagent.entities.MarketSnapshot snapshot = auditService.saveMarketSnapshot(
+                        share.getTicker(), indicatorsH1.isEmpty() ? indicatorsM15 : indicatorsH1, priceClose);
+                    if (snapshot != null) {
+                        auditService.saveTradeDecision(snapshot,
+                            com.example.tradingagent.entities.TradeDecision.DecisionType.IGNORE,
+                            "INSUFFICIENT_DATA",
+                            "Недостаточно индикаторов для анализа");
+                    }
+                    continue;
+                }
+
+                // ЛОГИРОВАНИЕ В БД: Сохраняем снимок рынка
+                HistoricCandle lastCandle = candlesH1.getLast();
+                BigDecimal priceClose = TinkoffApiUtils.quotationToBigDecimal(lastCandle.getClose());
+                com.example.tradingagent.entities.MarketSnapshot snapshot = auditService.saveMarketSnapshot(
+                    share.getTicker(), indicatorsH1, priceClose);
 
                 // --- ФИЛЬТР ADX (Только для новых входов) ---
                 if (!hasPosition) {
                     double adx = indicatorsH1.getOrDefault("adx_14", 0.0);
                     if (adx < MIN_ADX_THRESHOLD) {
                         skippedAdx++;
+                        // ЛОГИРОВАНИЕ РЕШЕНИЯ: Почему не торгуем
+                        if (snapshot != null) {
+                            auditService.saveTradeDecision(snapshot, 
+                                com.example.tradingagent.entities.TradeDecision.DecisionType.IGNORE,
+                                "FILTERED_BY_ADX",
+                                String.format("ADX=%.1f < %.1f (слабый тренд, флет)", adx, MIN_ADX_THRESHOLD));
+                        }
                         continue;
                     }
+                }
+
+                // ЛОГИРОВАНИЕ РЕШЕНИЯ: Если есть позиция - HOLD, иначе - потенциальный BUY сигнал
+                if (snapshot != null && hasPosition) {
+                    auditService.saveTradeDecision(snapshot,
+                        com.example.tradingagent.entities.TradeDecision.DecisionType.HOLD,
+                        "POSITION_ACTIVE",
+                        "Позиция уже открыта, мониторим SL/TP");
                 }
 
                 Map<String, Object> instrumentData = new HashMap<>();
@@ -179,6 +221,41 @@ public class MarketDataController {
 
             // Вызов индикаторов обновлен
             Map<String, Double> indicators = indicatorService.calculateIndicators(candles, tradeRequest.getTicker(), tradeRequest.getInstrumentFigi());
+
+            if (indicators.isEmpty()) {
+                return ResponseEntity.badRequest().body("Не удалось рассчитать индикаторы");
+            }
+
+            // ЛОГИРОВАНИЕ: Сохраняем снимок рынка перед выполнением сделки
+            HistoricCandle lastCandle = candles.getLast();
+            BigDecimal priceClose = TinkoffApiUtils.quotationToBigDecimal(lastCandle.getClose());
+            com.example.tradingagent.entities.MarketSnapshot snapshot = auditService.saveMarketSnapshot(
+                tradeRequest.getTicker(), indicators, priceClose);
+
+            // ЛОГИРОВАНИЕ РЕШЕНИЯ: Решение n8n
+            if (snapshot != null) {
+                TradeDecision.DecisionType decisionType = "BUY".equalsIgnoreCase(tradeRequest.getAction()) 
+                    ? TradeDecision.DecisionType.BUY 
+                    : "SELL".equalsIgnoreCase(tradeRequest.getAction()) 
+                        ? TradeDecision.DecisionType.SELL 
+                        : TradeDecision.DecisionType.HOLD;
+                
+                String reasonCode = tradeRequest.getReason() != null 
+                    ? tradeRequest.getReason().substring(0, Math.min(100, tradeRequest.getReason().length()))
+                    : "N8N_SIGNAL";
+                String reasonDetails = String.format("Score: %.2f, Reason: %s", 
+                    tradeRequest.getConfidenceScore(), 
+                    tradeRequest.getReason() != null ? tradeRequest.getReason() : "No reason provided");
+                
+                auditService.saveTradeDecision(snapshot, decisionType, reasonCode, reasonDetails);
+            }
+
+            // Проверка State Machine: можно ли торговать?
+            if (!stateMachine.canTrade(tradeRequest.getInstrumentFigi())) {
+                String state = stateMachine.getState(tradeRequest.getInstrumentFigi()).toString();
+                log("BLOCK: Инструмент " + tradeRequest.getTicker() + " в состоянии " + state);
+                return ResponseEntity.badRequest().body("Торговля заблокирована: инструмент в состоянии " + state);
+            }
 
             if (simulate) {
                 return ResponseEntity.ok().body("Simulation mode");

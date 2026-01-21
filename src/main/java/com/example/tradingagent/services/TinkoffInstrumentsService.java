@@ -17,10 +17,9 @@ public class TinkoffInstrumentsService {
     // ИЗМЕНЕНО: Список расширен до 15 инструментов
     private final List<String> blueChipsTickers = List.of(
             // Старые
-            "ROSN",
             "GAZP",
             "SBER",
-            "GMKN",
+//            "GMKN",
             "ROSN",
             "ALRS",
             "NLMK",
@@ -41,8 +40,18 @@ public class TinkoffInstrumentsService {
             "IRAO",
             "UGLD",
             "BSPB",
-            "MTSS",
+//            "MTSS",
             "FEES"
+            //НОВЫЕ
+//            "SFIN",
+//            "SELG",
+//            "T",
+//            "RNFT",
+//            "MTLR",
+//            "RAGR",
+//            "SBERP",
+//            "WUSH",
+//            "EUTR"
     );
 
     public TinkoffInstrumentsService() {

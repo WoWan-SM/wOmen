@@ -5,6 +5,7 @@ import com.example.tradingagent.TinkoffApiUtils;
 import com.example.tradingagent.dto.TradeRequest;
 import org.springframework.stereotype.Service;
 import ru.tinkoff.piapi.contract.v1.*;
+import ru.tinkoff.piapi.contract.v1.GetOrderBookResponse;
 import ru.tinkoff.piapi.core.InvestApi;
 import ru.tinkoff.piapi.core.models.Portfolio;
 import ru.tinkoff.piapi.core.models.Position;
@@ -27,11 +28,17 @@ public class TinkoffOrderService {
     private final InvestApi api;
     private final String accountId;
     private final RiskManagementService riskManagementService;
+    private final AuditService auditService;
+    private final TradingStateMachine stateMachine;
+    private final TelegramNotificationService telegramService;
 
     // --- НАСТРОЙКИ СТРАТЕГИИ (Улучшенные) ---
-    // Даем цене больше пространства, чтобы не вылетало по стопу на шуме
-    private static final BigDecimal ATR_MULTIPLIER_STOP_LOSS = new BigDecimal("3.0");
-    private static final BigDecimal ATR_MULTIPLIER_TAKE_PROFIT = new BigDecimal("6.0");
+    // Динамический риск-менеджмент на основе ATR согласно roadmap:
+    // Stop Loss = EntryPrice - (ATR * 2), Take Profit = EntryPrice + (ATR * 3)
+    private static final BigDecimal ATR_MULTIPLIER_STOP_LOSS = new BigDecimal("2.0");
+    private static final BigDecimal ATR_MULTIPLIER_TAKE_PROFIT = new BigDecimal("3.0");
+    // Trailing Stop: Если цена ушла в плюс на 1 * ATR, переносим стоп в безубыток
+    private static final BigDecimal ATR_MULTIPLIER_BREAKEVEN = new BigDecimal("1.0");
 
     // ГЛАВНЫЙ ФИЛЬТР: (Грязная Прибыль / Комиссия).
     // Если потенциальная прибыль меньше 3-х комиссий — сделка ОТМЕНЯЕТСЯ.
@@ -41,10 +48,17 @@ public class TinkoffOrderService {
     // ВАЖНО: Если у вас тариф "Инвестор", поменяйте на 0.003!
     private static final BigDecimal ESTIMATED_COMMISSION_RATE = new BigDecimal("0.0005");
 
-    public TinkoffOrderService(TinkoffAccountService accountService, RiskManagementService riskManagementService) {
+    public TinkoffOrderService(TinkoffAccountService accountService, 
+                               RiskManagementService riskManagementService,
+                               AuditService auditService,
+                               TradingStateMachine stateMachine,
+                               TelegramNotificationService telegramService) {
         this.api = TinkoffApi.getApi();
         this.accountId = accountService.getSandboxAccountId();
         this.riskManagementService = riskManagementService;
+        this.auditService = auditService;
+        this.stateMachine = stateMachine;
+        this.telegramService = telegramService;
     }
 
     private void log(String message) {
@@ -61,11 +75,6 @@ public class TinkoffOrderService {
         String ticker = instrument.getTicker();
 
         log(">>> АНАЛИЗ СИГНАЛА: " + tradeRequest.getAction() + " по " + ticker + " (Score: " + tradeRequest.getConfidenceScore() + ")");
-
-        if ("SNGS".equalsIgnoreCase(ticker)) {
-            log("SKIP: Инструмент в черном списке.");
-            return;
-        }
 
         // Получаем портфель (Portfolio, а не Positions, чтобы была средняя цена)
         Portfolio portfolio = api.getOperationsService().getPortfolioSync(accountId);
@@ -219,26 +228,68 @@ public class TinkoffOrderService {
             return;
         }
 
-        // 3. Трейлинг Стоп
+        // 3. Динамический Трейлинг Стоп с безубытком
         StopOrder stopOrder = existingSl.get();
         BigDecimal oldStopLossPrice = TinkoffApiUtils.moneyValueToBigDecimal(stopOrder.getStopPrice());
-        BigDecimal updateThreshold = realTimePrice.multiply(new BigDecimal("0.005")); // 0.5% шаг
+        BigDecimal atrMultiplier = BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_BREAKEVEN);
+        
+        // Получаем среднюю цену входа позиции
+        BigDecimal avgPrice = BigDecimal.ZERO;
+        if (position.getAveragePositionPrice() != null) {
+            avgPrice = position.getAveragePositionPrice().getValue();
+        }
 
         if (stopOrder.getDirection() == StopOrderDirection.STOP_ORDER_DIRECTION_SELL) { // LONG
-            BigDecimal newStopLossPrice = realTimePrice.subtract(BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_STOP_LOSS));
-            BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
-
-            if (roundedNewSl.compareTo(oldStopLossPrice.add(updateThreshold)) > 0) {
-                log(String.format("TRAILING LONG: %s -> %s (Цена: %s)", oldStopLossPrice, roundedNewSl, realTimePrice));
-                updateStopLossOrder(stopOrder, roundedNewSl, instrument);
+            BigDecimal priceGain = realTimePrice.subtract(avgPrice);
+            
+            // Если цена ушла в плюс на 1 * ATR, переносим стоп в безубыток (BREAKEVEN)
+            if (priceGain.compareTo(atrMultiplier) >= 0 && avgPrice.compareTo(BigDecimal.ZERO) > 0) {
+                // Переносим стоп в безубыток (с небольшим отступом)
+                BigDecimal breakevenStop = avgPrice.add(minPriceIncrement.multiply(BigDecimal.valueOf(5))); // +5 шагов для защиты
+                BigDecimal roundedBreakeven = TinkoffApiUtils.roundToStep(breakevenStop, minPriceIncrement);
+                
+                if (roundedBreakeven.compareTo(oldStopLossPrice) > 0) {
+                    log(String.format("TRAILING TO BREAKEVEN LONG: %s -> %s (Цена: %s, Entry: %s)", 
+                        oldStopLossPrice, roundedBreakeven, realTimePrice, avgPrice));
+                    updateStopLossOrder(stopOrder, roundedBreakeven, instrument);
+                }
+            } else {
+                // Обычный трейлинг: стоп на ATR * 2 от текущей цены
+                BigDecimal newStopLossPrice = realTimePrice.subtract(BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_STOP_LOSS));
+                BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
+                
+                // Обновляем только если новый стоп выше старого и выше безубытка
+                BigDecimal minStop = avgPrice.add(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                if (roundedNewSl.compareTo(minStop) > 0 && roundedNewSl.compareTo(oldStopLossPrice) > 0) {
+                    log(String.format("TRAILING LONG: %s -> %s (Цена: %s)", oldStopLossPrice, roundedNewSl, realTimePrice));
+                    updateStopLossOrder(stopOrder, roundedNewSl, instrument);
+                }
             }
         } else { // SHORT
-            BigDecimal newStopLossPrice = realTimePrice.add(BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_STOP_LOSS));
-            BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
-
-            if (roundedNewSl.compareTo(oldStopLossPrice.subtract(updateThreshold)) < 0) {
-                log(String.format("TRAILING SHORT: %s -> %s (Цена: %s)", oldStopLossPrice, roundedNewSl, realTimePrice));
-                updateStopLossOrder(stopOrder, roundedNewSl, instrument);
+            BigDecimal priceGain = avgPrice.subtract(realTimePrice);
+            
+            // Если цена ушла в плюс на 1 * ATR, переносим стоп в безубыток
+            if (priceGain.compareTo(atrMultiplier) >= 0 && avgPrice.compareTo(BigDecimal.ZERO) > 0) {
+                // Переносим стоп в безубыток (с небольшим отступом)
+                BigDecimal breakevenStop = avgPrice.subtract(minPriceIncrement.multiply(BigDecimal.valueOf(5))); // -5 шагов для защиты
+                BigDecimal roundedBreakeven = TinkoffApiUtils.roundToStep(breakevenStop, minPriceIncrement);
+                
+                if (roundedBreakeven.compareTo(oldStopLossPrice) < 0) {
+                    log(String.format("TRAILING TO BREAKEVEN SHORT: %s -> %s (Цена: %s, Entry: %s)", 
+                        oldStopLossPrice, roundedBreakeven, realTimePrice, avgPrice));
+                    updateStopLossOrder(stopOrder, roundedBreakeven, instrument);
+                }
+            } else {
+                // Обычный трейлинг: стоп на ATR * 2 от текущей цены
+                BigDecimal newStopLossPrice = realTimePrice.add(BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_STOP_LOSS));
+                BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
+                
+                // Обновляем только если новый стоп ниже старого и ниже безубытка
+                BigDecimal maxStop = avgPrice.subtract(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                if (roundedNewSl.compareTo(maxStop) < 0 && roundedNewSl.compareTo(oldStopLossPrice) < 0) {
+                    log(String.format("TRAILING SHORT: %s -> %s (Цена: %s)", oldStopLossPrice, roundedNewSl, realTimePrice));
+                    updateStopLossOrder(stopOrder, roundedNewSl, instrument);
+                }
             }
         }
     }
@@ -258,6 +309,7 @@ public class TinkoffOrderService {
         log("--- ПОПЫТКА ВХОДА: " + ticker + " (" + positionType + ") ---");
 
         try {
+            // ПРОВЕРКА БАЛАНСА ПЕРЕД ОРДЕРОМ (Pre-flight Check)
             var marginAttributes = api.getUserService().getMarginAttributesSync(accountId);
             BigDecimal availableMargin = TinkoffApiUtils.moneyValueToBigDecimal(marginAttributes.getLiquidPortfolio())
                     .subtract(TinkoffApiUtils.moneyValueToBigDecimal(marginAttributes.getStartingMargin()));
@@ -273,6 +325,28 @@ public class TinkoffOrderService {
                 return;
             }
 
+            // ФИЛЬТР СПРЕДА: Если спред > 0.05%, комиссия съест прибыль
+            try {
+                GetOrderBookResponse orderBook = api.getMarketDataService().getOrderBookSync(instrument.getFigi(), 10);
+                if (!orderBook.getBidsList().isEmpty() && !orderBook.getAsksList().isEmpty()) {
+                    BigDecimal bestBid = TinkoffApiUtils.quotationToBigDecimal(orderBook.getBidsList().get(0).getPrice());
+                    BigDecimal bestAsk = TinkoffApiUtils.quotationToBigDecimal(orderBook.getAsksList().get(0).getPrice());
+                    BigDecimal spread = bestAsk.subtract(bestBid);
+                    BigDecimal spreadPercent = spread.divide(bestBid, 6, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
+                    
+                    BigDecimal MAX_SPREAD_PERCENT = new BigDecimal("0.05"); // 0.05%
+                    if (spreadPercent.compareTo(MAX_SPREAD_PERCENT) > 0) {
+                        logError(String.format("ОТКАЗ: Большой спред %.4f%% > %.4f%% для %s (комиссия съест прибыль)", 
+                            spreadPercent, MAX_SPREAD_PERCENT, ticker));
+                        return;
+                    }
+                    log(String.format("Спред для %s: %.4f%% (OK)", ticker, spreadPercent));
+                }
+            } catch (Exception e) {
+                logError("Ошибка проверки спреда для " + ticker + ": " + e.getMessage());
+                // Продолжаем, если не удалось получить спред
+            }
+
             BigDecimal stopLossOffset = BigDecimal.valueOf(atrValue).multiply(ATR_MULTIPLIER_STOP_LOSS);
             BigDecimal stopLossPrice = (positionType == PositionType.LONG) ? currentPrice.subtract(stopLossOffset) : currentPrice.add(stopLossOffset);
 
@@ -280,6 +354,17 @@ public class TinkoffOrderService {
 
             if (lotsToTrade == 0) {
                 logError("ОТКАЗ: Risk-менеджер (lots=0).");
+                telegramService.notifyRejection(ticker, "Risk-менеджер вернул 0 лотов");
+                return;
+            }
+
+            // ПРОВЕРКА СВОБОДНЫХ СРЕДСТВ (Pre-flight Check)
+            BigDecimal tradeAmount = currentPrice.multiply(BigDecimal.valueOf(lotsToTrade * instrument.getLot()));
+            if (availableMargin.compareTo(tradeAmount) < 0) {
+                String errorMsg = String.format("Недостаточно средств. Требуется: %s руб, Доступно: %s руб", 
+                    tradeAmount, availableMargin);
+                logError("ОТКАЗ: " + errorMsg);
+                telegramService.notifyError(errorMsg);
                 return;
             }
 
@@ -295,6 +380,17 @@ public class TinkoffOrderService {
             OrderDirection orderDirection = (positionType == PositionType.LONG) ? OrderDirection.ORDER_DIRECTION_BUY : OrderDirection.ORDER_DIRECTION_SELL;
 
             log("Отправка рыночного ордера...");
+            
+            // STATE MACHINE: Переход в ENTRY_PENDING
+            stateMachine.setEntryPending(instrument.getFigi(), orderId);
+            
+            // ЛОГИРОВАНИЕ: Сохраняем ордер
+            com.example.tradingagent.entities.OrderEntity.Direction direction = 
+                (positionType == PositionType.LONG) 
+                    ? com.example.tradingagent.entities.OrderEntity.Direction.BUY 
+                    : com.example.tradingagent.entities.OrderEntity.Direction.SELL;
+            auditService.saveOrder(ticker, direction, currentPrice, lotsToTrade, orderId);
+            
             api.getOrdersService().postOrderSync(
                     instrument.getFigi(), lotsToTrade, Quotation.newBuilder().build(), orderDirection,
                     accountId, OrderType.ORDER_TYPE_MARKET, orderId
@@ -305,18 +401,41 @@ public class TinkoffOrderService {
 
             if (positionOpened) {
                 log("ПОЗИЦИЯ ОТКРЫТА. Выставляем стопы.");
+                
+                // STATE MACHINE: Переход в ACTIVE
+                stateMachine.setActive(instrument.getFigi());
+                
+                // ЛОГИРОВАНИЕ: Обновляем статус ордера и создаем позицию
+                auditService.updateOrderStatus(orderId, 
+                    com.example.tradingagent.entities.OrderEntity.OrderStatus.FILLED,
+                    currentPrice, null, null);
+                
+                // TELEGRAM: Уведомление о покупке
+                telegramService.notifyTrade(tradeRequest.getAction(), ticker, currentPrice, lotsToTrade);
+                
                 StopOrderDirection stopDir = (positionType == PositionType.LONG) ? StopOrderDirection.STOP_ORDER_DIRECTION_SELL : StopOrderDirection.STOP_ORDER_DIRECTION_BUY;
                 BigDecimal minStep = TinkoffApiUtils.quotationToBigDecimal(instrument.getMinPriceIncrement());
 
-                postMarketStopLossOrder(instrument.getFigi(), lotsToTrade, TinkoffApiUtils.roundToStep(stopLossPrice, minStep), stopDir, ticker);
-
+                BigDecimal roundedSl = TinkoffApiUtils.roundToStep(stopLossPrice, minStep);
                 BigDecimal roundedTp = TinkoffApiUtils.roundToStep(takeProfitPrice, minStep);
+                
+                postMarketStopLossOrder(instrument.getFigi(), lotsToTrade, roundedSl, stopDir, ticker);
+
                 BigDecimal slippage = minStep.multiply(BigDecimal.valueOf(20));
                 BigDecimal executionPrice = (positionType == PositionType.LONG) ? roundedTp.subtract(slippage) : roundedTp.add(slippage);
 
                 postLimitTakeProfitOrder(instrument.getFigi(), lotsToTrade, roundedTp, TinkoffApiUtils.roundToStep(executionPrice, minStep), stopDir, ticker);
+                
+                // TELEGRAM: Уведомление об открытии позиции со стопами
+                telegramService.notifyPositionOpened(ticker, currentPrice, roundedSl, roundedTp);
             } else {
                 logError("CRITICAL: Позиция не появилась на балансе!");
+                // STATE MACHINE: Возврат к SCANNING
+                stateMachine.resetToScanning(instrument.getFigi());
+                // ЛОГИРОВАНИЕ: Обновляем статус ордера как REJECTED
+                auditService.updateOrderStatus(orderId, 
+                    com.example.tradingagent.entities.OrderEntity.OrderStatus.REJECTED,
+                    null, null, "Позиция не появилась на балансе");
             }
 
         } catch (Exception e) {
