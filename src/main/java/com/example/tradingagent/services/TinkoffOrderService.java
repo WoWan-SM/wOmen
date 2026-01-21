@@ -391,10 +391,23 @@ public class TinkoffOrderService {
                     : com.example.tradingagent.entities.OrderEntity.Direction.SELL;
             auditService.saveOrder(ticker, direction, currentPrice, lotsToTrade, orderId);
             
-            api.getOrdersService().postOrderSync(
-                    instrument.getFigi(), lotsToTrade, Quotation.newBuilder().build(), orderDirection,
-                    accountId, OrderType.ORDER_TYPE_MARKET, orderId
-            );
+            try {
+                api.getOrdersService().postOrderSync(
+                        instrument.getFigi(), lotsToTrade, Quotation.newBuilder().build(), orderDirection,
+                        accountId, OrderType.ORDER_TYPE_MARKET, orderId
+                );
+            } catch (Exception e) {
+                logError("ОШИБКА ОТПРАВКИ ОРДЕРА: " + e.getMessage());
+                // ЛОГИРОВАНИЕ: Обновляем статус ордера как REJECTED
+                auditService.updateOrderStatus(orderId, 
+                    com.example.tradingagent.entities.OrderEntity.OrderStatus.REJECTED,
+                    null, null, e.getMessage());
+                // STATE MACHINE: Возврат к SCANNING
+                stateMachine.resetToScanning(instrument.getFigi());
+                // TELEGRAM: Уведомление об ошибке
+                telegramService.notifyError("Ошибка отправки ордера для " + ticker + ": " + e.getMessage());
+                return;
+            }
 
             log("Ордер отправлен. Ожидание позиции...");
             boolean positionOpened = waitForPosition(instrument.getFigi(), 15, 1000);
@@ -405,10 +418,17 @@ public class TinkoffOrderService {
                 // STATE MACHINE: Переход в ACTIVE
                 stateMachine.setActive(instrument.getFigi());
                 
-                // ЛОГИРОВАНИЕ: Обновляем статус ордера и создаем позицию
+                // ЛОГИРОВАНИЕ: Обновляем статус ордера
                 auditService.updateOrderStatus(orderId, 
                     com.example.tradingagent.entities.OrderEntity.OrderStatus.FILLED,
                     currentPrice, null, null);
+                
+                // ЛОГИРОВАНИЕ: Создаем позицию для отслеживания PnL
+                var savedOrderOpt = auditService.getOrderRepository().findByBrokerOrderId(orderId);
+                if (savedOrderOpt.isPresent()) {
+                    auditService.createPosition(savedOrderOpt.get(), currentPrice);
+                    log("Позиция создана в БД для отслеживания PnL");
+                }
                 
                 // TELEGRAM: Уведомление о покупке
                 telegramService.notifyTrade(tradeRequest.getAction(), ticker, currentPrice, lotsToTrade);

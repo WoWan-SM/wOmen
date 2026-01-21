@@ -35,7 +35,7 @@ public class TelegramNotificationService {
      */
     private void sendMessage(String message) {
         if (!isEnabled()) {
-            logger.debug("Telegram уведомления отключены");
+            logger.debug("Telegram уведомления отключены (не настроены botToken или chatId)");
             return;
         }
 

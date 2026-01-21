@@ -184,4 +184,11 @@ public class AuditService {
             logger.error("Ошибка закрытия позиции {}: ", position.getId(), e);
         }
     }
+
+    /**
+     * Получает репозиторий ордеров (для доступа из других сервисов).
+     */
+    public OrderEntityRepository getOrderRepository() {
+        return orderEntityRepository;
+    }
 }

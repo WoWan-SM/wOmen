@@ -11,5 +11,6 @@ import java.util.UUID;
 @Repository
 public interface TradeDecisionRepository extends JpaRepository<TradeDecision, UUID> {
     List<TradeDecision> findByTimestampBetween(Instant start, Instant end);
+    List<TradeDecision> findByTimestampAfter(Instant start);
     List<TradeDecision> findByDecision(TradeDecision.DecisionType decision);
 }

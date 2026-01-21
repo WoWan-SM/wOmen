@@ -30,7 +30,6 @@ public class MarketDataController {
     private static final BigDecimal MIN_TURNOVER_RUB = new BigDecimal("500000");
     // Фильтр "Пилы" (Choppy Market): ADX < 25 запрещает вход по трендовым стратегиям
     private static final double MIN_ADX_THRESHOLD = 25.0;
-    private static final BigDecimal DAILY_LOSS_LIMIT = new BigDecimal("3000.00");
     private final TinkoffMarketDataService marketDataService;
     private final TechnicalIndicatorService indicatorService;
     private final TinkoffOrderService orderService;
@@ -40,8 +39,6 @@ public class MarketDataController {
     private final AuditService auditService;
     private final TradingStateMachine stateMachine;
     private final InvestApi api;
-    // Circuit Breaker
-    private final BigDecimal dailyLoss = BigDecimal.ZERO;
 
     @Autowired
     public MarketDataController(TinkoffMarketDataService marketDataService,
@@ -207,11 +204,6 @@ public class MarketDataController {
 
             if (tradeRequest.getReason() != null) {
                  log("Reason: " + tradeRequest.getReason());
-            }
-
-            if (dailyLoss.compareTo(DAILY_LOSS_LIMIT) >= 0) {
-                log("BLOCK: Дневной лимит убытка превышен!");
-                return ResponseEntity.badRequest().body("Торговля остановлена: превышен дневной лимит убытка.");
             }
 
             Instant effectiveTimeTo = to.orElse(Instant.now());

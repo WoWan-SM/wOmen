@@ -21,6 +21,9 @@ public class TradingAgentApplication {
 		System.out.println("\tLocal: \t\thttp://localhost:" + port + contextPath);
 		System.out.println("\tScan Market: \thttp://localhost:" + port + contextPath + "/api/scan-market");
 		System.out.println("\tExcel Report: \thttp://localhost:" + port + contextPath + "/api/reports/excel");
+		System.out.println("\tStatistics: \thttp://localhost:" + port + contextPath + "/api/statistics/decisions");
+		System.out.println("\tPositions: \thttp://localhost:" + port + contextPath + "/api/statistics/positions");
+		System.out.println("\tDaily Stats: \thttp://localhost:" + port + contextPath + "/api/statistics/daily");
 		System.out.println("----------------------------------------------------------\n");
 	}
 }

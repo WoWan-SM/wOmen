@@ -12,4 +12,5 @@ import java.util.UUID;
 public interface PositionEntityRepository extends JpaRepository<PositionEntity, UUID> {
     List<PositionEntity> findByExitOrderIsNull();
     List<PositionEntity> findByTimestampBetween(Instant start, Instant end);
+    List<PositionEntity> findByTimestampAfter(Instant start);
 }

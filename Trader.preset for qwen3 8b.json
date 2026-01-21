@@ -1,0 +1,61 @@
+{
+  "identifier": "@local:trader",
+  "name": "Trader",
+  "changed": true,
+  "operation": {
+    "fields": [
+      {
+        "key": "llm.prediction.repeatPenalty",
+        "value": {
+          "checked": false,
+          "value": 1.1
+        }
+      },
+      {
+        "key": "llm.prediction.structured",
+        "value": {
+          "type": "json",
+          "jsonSchema": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+              "sentiment": {
+                "type": "string"
+              },
+              "instrument_figi": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "sentiment",
+              "instrument_figi"
+            ]
+          }
+        }
+      },
+      {
+        "key": "llm.prediction.temperature",
+        "value": 0
+      },
+      {
+        "key": "llm.prediction.maxPredictedTokens",
+        "value": {
+          "checked": true,
+          "value": 128
+        }
+      },
+      {
+        "key": "llm.prediction.llama.cpuThreads",
+        "value": 18
+      },
+      {
+        "key": "ext.virtualModel.customField.openai.gptOss20b.reasoningEffort",
+        "value": "high"
+      }
+    ]
+  },
+  "load": {
+    "fields": []
+  }
+}

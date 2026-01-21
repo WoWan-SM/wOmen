@@ -1,0 +1,352 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "=http://host.docker.internal:8080/api/scan-market?to={{ $json.date_to }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -560,
+        272
+      ],
+      "id": "5674fda2-9f3d-42f1-91b7-75d09b65233e",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "bb2ded45-879f-4783-ad95-c894d4b7ee67",
+              "name": "messages",
+              "value": "=[\n  {\n    \"role\": \"user\",\n    \"content\": \"Твоя задача — проанализировать предоставленные новостные заголовки и определить их общее настроение (сентимент) для трейдера. После анализа, ты должен вернуть JSON, который содержит твою оценку, а также исходные технические данные.\\n\\nВот данные для анализа:\\n TICKER NEWS: {{ $json.promptData.ticker_news }}, RUSSIA NEWS: {{ $json.promptData.general_news }}, FIGI: {{ $json.promptData.instrument_figi }} \\n\\nИнструкции:\\n1. Прочитай все заголовки из 'ticker_news' и 'general_news'.\\n2. Если среди них есть явно негативные для российского рынка или компании новости (например, 'санкции', 'обвал', 'расследование', 'падение прибыли', 'атака'), классифицируй сентимент как 'Negative'.\\n3. Если есть явно позитивные новости (например, 'рекордная прибыль', 'прорыв', 'рост', 'новые дивиденды'), классифицируй сентимент как 'Positive'.\\n4. Если новости нейтральные или смешанные, классифицируй сентимент как 'Neutral'. \n  }\n]\n",
+              "type": "string"
+            },
+            {
+              "id": "773e7808-719c-4768-b461-82662fb4b307",
+              "name": "promptData",
+              "value": "={{ $json.promptData }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -208,
+        272
+      ],
+      "id": "485bf3ac-a1b1-4428-b899-50b16b218d69",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "3e3ae96d-e7e2-44c6-9753-410c9edc2b22",
+              "leftValue": "={{ $json.confidence_score }}",
+              "rightValue": 0.8,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        784,
+        272
+      ],
+      "id": "e5fad217-a737-4921-92f1-ae90df9388dd",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8080/api/execute-trade",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1088,
+        304
+      ],
+      "id": "ad1b5b41-c8a7-491e-831a-a15f0d5d8dea",
+      "name": "HTTP Request1",
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "9f273736-b4df-4931-92ef-3396a9466e26",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Этот код выполняется после LLM и перед узлом If.\n// Он принимает массив ответов, выполняет скоринг и фильтрует только торговые сигналы.\n\nconst allResults = $input.all();\nconst promtDatas = $('Edit Fields').all();\nconst tradeSignals = [];\n\n// Порог силы тренда. Если ADX ниже, торговля запрещена.\nconst MIN_ADX = 20.0; \n\nconsole.log(`Получено ${allResults.length} ответов от LLM для анализа.`);\n\nfor (const item of allResults) {\n    for (const promptData of promtDatas) {\n        // Защита от ошибок чтения структуры\n        if (!promptData.json.promptData) continue;\n\n        const {\n            instrument_figi,\n            ticker,\n            indicators_h1,\n            indicators_m15,\n            order_book\n        } = promptData.json.promptData;\n      \n        // Проверяем совпадение FIGI\n        if (item.json.output && instrument_figi != item.json.output.instrument_figi) {\n            continue;\n        }\n\n        // --- ФИЛЬТР ADX (ИСПРАВЛЕНО) ---\n        // Обернули в Number(), чтобы гарантировать числовой тип и избежать .toFixed error\n        const adx = Number(indicators_h1.adx_14 || 0);\n\n        if (adx < MIN_ADX) {\n             tradeSignals.push({\n                json: {\n                    action: 'HOLD',\n                    instrument_figi: instrument_figi,\n                    ticker: ticker,\n                    confidence_score: 0.0,\n                    reason: `Low ADX (${adx.toFixed(1)} < ${MIN_ADX}). Flat market.`\n                }\n            });\n            continue; // Переходим к следующему инструменту\n        }\n\n        let buyScore = 0;\n        let sellScore = 0;\n\n        // --- Оценка факторов для ПОКУПКИ (BUY) ---\n        let buyReason = `ADX=${adx.toFixed(1)}, `;\n\n        if (indicators_h1.current_price > indicators_h1.ema_100 && indicators_h1.macd_hist > 0) {\n            buyScore += 2;\n            buyReason += \"H1 Trend=2, \";\n        } else {\n            buyReason += \"H1 Trend=0, \";\n        }\n        if (indicators_m15.macd_hist > 0 && indicators_m15.macd_hist > indicators_m15.macd_hist_previous) {\n            buyScore += 1;\n            buyReason += \"M15 Entry=1, \";\n        } else {\n            buyReason += \"M15 Entry=0, \";\n        }\n        if (order_book && order_book.bids_volume > order_book.asks_volume) {\n            buyScore += 1;\n            buyReason += \"Order Book=1, \";\n        } else {\n            buyReason += \"Order Book=0, \";\n        }\n        if (item.json.output && item.json.output.sentiment !== 'Negative') {\n            buyScore += 0.5;\n            buyReason += \"News=0.5. \";\n        } else {\n            buyReason += \"News=0. \";\n        }\n\n        // --- Оценка факторов для ПРОДАЖИ (SELL) ---\n        let sellReason = `ADX=${adx.toFixed(1)}, `;\n        \n        if (indicators_h1.current_price < indicators_h1.ema_100 && indicators_h1.macd_hist < 0) {\n            sellScore += 2;\n            sellReason += \"H1 Trend=2, \";\n        } else {\n            sellReason += \"H1 Trend=0, \";\n        }\n        if (indicators_m15.macd_hist < 0 && indicators_m15.macd_hist < indicators_m15.macd_hist_previous) {\n            sellScore += 1;\n            sellReason += \"M15 Entry=1, \";\n        } else {\n            sellReason += \"M15 Entry=0, \";\n        }\n        if (order_book && order_book.asks_volume > order_book.bids_volume) {\n            sellScore += 1;\n            sellReason += \"Order Book=1, \";\n        } else {\n            sellReason += \"Order Book=0, \";\n        }\n        if (item.json.output && item.json.output.sentiment !== 'Positive') {\n            sellScore += 0.5;\n            sellReason += \"News=0.5. \";\n        } else {\n            sellReason += \"News=0. \";\n        }\n\n        // --- Финальное решение ---\n        if (buyScore >= 3.5) {\n            tradeSignals.push({\n                json: {\n                    action: 'BUY',\n                    instrument_figi: instrument_figi,\n                    ticker: ticker,\n                    confidence_score: 0.9,\n                    reason: buyReason + `Total: ${buyScore} -> BUY`\n                }\n            });\n        } else if (sellScore >= 3.5) {\n            tradeSignals.push({\n                json: {\n                    action: 'SELL',\n                    instrument_figi: instrument_figi,\n                    ticker: ticker,\n                    confidence_score: 0.9,\n                    reason: sellReason + `Total: ${sellScore} -> SELL`\n                }\n            });\n        } else {\n              tradeSignals.push({\n                json: {\n                    action: 'HOLD',\n                    instrument_figi: instrument_figi,\n                    ticker: ticker,\n                    confidence_score: 0.0,\n                    reason: `Total: ${sellScore}`\n                }\n            });\n        }\n    }\n}\n\nconsole.log(`Найдено ${tradeSignals.length} торговых сигналов для исполнения.`);\n\n// 4. Возвращаем массив только с теми сделками, которые нужно исполнить\nreturn tradeSignals;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        272
+      ],
+      "id": "89b340c5-29ab-45aa-a996-3d33a2f90263",
+      "name": "Code1",
+      "alwaysOutputData": true,
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Этот узел принимает на вход полные данные по инструменту\n// и создает новый, оптимизированный объект для передачи в LLM.\n\nconst item = $input.item;\nconst { \n    indicators_h1, \n    indicators_m15, \n    order_book, \n    ticker_news, \n    general_news, \n    instrument_figi, \n    ticker \n} = $input.item.json;\n\n// Создаем новый объект только с теми полями, которые нужны для промпта\nconst promptData = {\n  instrument_figi: instrument_figi,\n  ticker: ticker,\n  indicators_h1: {\n    current_price: indicators_h1.current_price,\n    ema_100: indicators_h1.ema_100,\n    macd_hist: indicators_h1.macd_hist,\n    adx_14: indicators_h1.adx_14 // <--- ДОБАВЛЕНО: Прокидываем ADX\n  },\n  indicators_m15: {\n    macd_hist: indicators_m15.macd_hist,\n    macd_hist_previous: indicators_m15.macd_hist_previous\n  },\n  order_book: order_book, // Может отсутствовать в режиме бэктеста\n  ticker_news: ticker_news, // Может отсутствовать в режиме бэктеста\n  general_news: general_news // Может отсутствовать в режиме бэктеста\n};\n\n// Сохраняем оптимизированные данные в новое поле\nitem.json.promptData = promptData;\n\n// Удаляем ненужные больше поля из основного объекта, чтобы сделать его чище\ndelete item.json.indicators_h1;\ndelete item.json.indicators_m15;\ndelete item.json.order_book;\ndelete item.json.ticker_news;\ndelete item.json.general_news;\ndelete item.json.candles_count;\n\n\nreturn item;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -384,
+        272
+      ],
+      "id": "d7f12a73-cd1b-4bb3-8113-93d170fc8e5c",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.messages }}",
+        "hasOutputParser": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        48,
+        272
+      ],
+      "id": "529d22fe-5a37-44d6-b21c-d308016e16a3",
+      "name": "AI Agent",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "qwen3-8b"
+        },
+        "options": {
+          "responseFormat": "=text"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -16,
+        576
+      ],
+      "id": "c7b51473-e5df-4c55-a860-ecc9b9416aa8",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "tCTCJnFiaHuO34lf",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"sentiment\": \"Neutral\",\n  \"instrument_figi\": \"BBG004RVFCY3\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        256,
+        560
+      ],
+      "id": "d59a7801-60d4-4940-b4ed-9714780fd6b2",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -784,
+        272
+      ],
+      "id": "c28adb5f-7e3d-4137-911d-3771320d893a",
+      "name": "Schedule Trigger"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "timezone": "Europe/Istanbul",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "d9dea1cb-4d44-49c4-a091-075816f2f4d5",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "0c182a540907a637211c8586a7c8ed59c4ae6d296192904b1d81ca10e4848ed9"
+  },
+  "id": "p4kqjwhkTj4B4tr23sida",
+  "tags": []
+}

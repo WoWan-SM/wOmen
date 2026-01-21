@@ -28,15 +28,6 @@ public class NewsService {
         return fetchPulseFeed(url, "Ticker " + ticker);
     }
 
-    public List<String> getGeneralRussianNews() {
-        if (sessionId == null || sessionId.isBlank()) {
-            System.err.println("Переменная окружения TINKOFF_SESSION_ID не установлена. Анализ общих новостей пропускается.");
-            return List.of();
-        }
-        String url = "https://api-invest-gw.tinkoff.ru/social/post/feed/v1/feed?limit=5";
-        return fetchPulseFeed(url, "General Feed");
-    }
-
     private List<String> fetchPulseFeed(String url, String identifier) {
         System.out.println("ЗАПРОС К TINKOFF PULSE API: " + identifier);
         List<String> content = new ArrayList<>();

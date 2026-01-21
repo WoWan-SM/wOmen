@@ -12,4 +12,5 @@ import java.util.UUID;
 public interface MarketSnapshotRepository extends JpaRepository<MarketSnapshot, UUID> {
     List<MarketSnapshot> findByTickerOrderByTimestampDesc(String ticker);
     List<MarketSnapshot> findByTimestampBetween(Instant start, Instant end);
+    List<MarketSnapshot> findTop10ByOrderByTimestampDesc();
 }
