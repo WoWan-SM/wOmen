@@ -33,9 +33,9 @@ public class TinkoffMarketDataService {
      * @return Список объектов HistoricCandle.
      */
     public List<HistoricCandle> getHistoricCandles(String instrumentFigi, int days, CandleInterval interval, Instant to) {
-        // Увеличиваем количество дней в 3 раза для достаточного количества свечей
+        // Увеличиваем количество дней в 1 раз для достаточного количества свечей
         // Индикаторы ADX/EMA требуют "разгона", минимум 28-50 свечей при периоде 14
-        int extendedDays = Math.max(days * 3, 15); // Минимум 60 дней для надежности
+        int extendedDays = Math.max(days * 1, 10); // Минимум 60 дней для надежности
         Instant from = to.minus(extendedDays, ChronoUnit.DAYS);
 
         try {

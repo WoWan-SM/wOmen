@@ -90,7 +90,7 @@ public class MarketDataController {
         }
 
         int daysToRequestH1 = 30;
-        int daysToRequestM15 = 1;
+        int daysToRequestM15 = 20;
 
         int skippedTurnover = 0;
         int skippedAdx = 0;
@@ -190,7 +190,7 @@ public class MarketDataController {
                 System.err.println("Ошибка при анализе " + share.getTicker() + ": " + e.getMessage());
             }
         }
-        log(String.format("Итоги: %d тикеров -> n8n. Скип: %d (объем), %d (ADX).", marketData.size(), skippedTurnover, skippedAdx));
+        log(String.format("Итоги: %d тикеров. Скип: %d (объем), %d (ADX).", marketData.size(), skippedTurnover, skippedAdx));
         return ResponseEntity.ok(marketData);
     }
 
@@ -199,7 +199,7 @@ public class MarketDataController {
                                           @RequestParam(name = "simulate", defaultValue = "false") boolean simulate,
                                           @RequestParam(name = "to", required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Optional<Instant> to) {
         try {
-            log("<<< СИГНАЛ n8n: " + tradeRequest.getAction() + " | " + tradeRequest.getTicker() +
+            log("<<< СИГНАЛ: " + tradeRequest.getAction() + " | " + tradeRequest.getTicker() +
                     " | Score: " + tradeRequest.getConfidenceScore());
 
             if (tradeRequest.getReason() != null) {
@@ -234,7 +234,7 @@ public class MarketDataController {
                 
                 String reasonCode = tradeRequest.getReason() != null 
                     ? tradeRequest.getReason().substring(0, Math.min(100, tradeRequest.getReason().length()))
-                    : "N8N_SIGNAL";
+                    : "TRADING_SIGNAL";
                 String reasonDetails = String.format("Score: %.2f, Reason: %s", 
                     tradeRequest.getConfidenceScore(), 
                     tradeRequest.getReason() != null ? tradeRequest.getReason() : "No reason provided");

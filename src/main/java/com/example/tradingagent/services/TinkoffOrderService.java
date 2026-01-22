@@ -35,10 +35,10 @@ public class TinkoffOrderService {
     // --- НАСТРОЙКИ СТРАТЕГИИ (Улучшенные) ---
     // Динамический риск-менеджмент на основе ATR согласно roadmap:
     // Stop Loss = EntryPrice - (ATR * 2), Take Profit = EntryPrice + (ATR * 3)
-    private static final BigDecimal ATR_MULTIPLIER_STOP_LOSS = new BigDecimal("2.0");
-    private static final BigDecimal ATR_MULTIPLIER_TAKE_PROFIT = new BigDecimal("3.0");
+    private static final BigDecimal ATR_MULTIPLIER_STOP_LOSS = new BigDecimal("3.0");
+    private static final BigDecimal ATR_MULTIPLIER_TAKE_PROFIT = new BigDecimal("5.5");
     // Trailing Stop: Если цена ушла в плюс на 1 * ATR, переносим стоп в безубыток
-    private static final BigDecimal ATR_MULTIPLIER_BREAKEVEN = new BigDecimal("1.0");
+    private static final BigDecimal ATR_MULTIPLIER_BREAKEVEN = new BigDecimal("0.5");
 
     // ГЛАВНЫЙ ФИЛЬТР: (Грязная Прибыль / Комиссия).
     // Если потенциальная прибыль меньше 3-х комиссий — сделка ОТМЕНЯЕТСЯ.

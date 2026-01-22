@@ -1,39 +1,59 @@
 package com.example.tradingagent.services;
 
+import com.example.tradingagent.TinkoffApi;
 import com.example.tradingagent.TinkoffApiUtils;
+import com.example.tradingagent.dto.TradeRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import ru.tinkoff.piapi.contract.v1.CandleInterval;
 import ru.tinkoff.piapi.contract.v1.HistoricCandle;
+import ru.tinkoff.piapi.contract.v1.Instrument;
+import ru.tinkoff.piapi.core.InvestApi;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 
 /**
  * Backtesting Engine для тестирования стратегии на исторических данных.
  * Прогоняет TechnicalIndicatorService по историческим данным и симулирует сделки без отправки в API.
+ * Соответствует логике реальных торгов из TinkoffOrderService.
  */
 @Service
 public class BacktestEngine {
 
     private static final Logger logger = LoggerFactory.getLogger(BacktestEngine.class);
     
-    // Параметры стратегии (из roadmap)
-    private static final double MIN_ADX_THRESHOLD = 25.0;
+    // Параметры стратегии (из TinkoffOrderService)
     private static final BigDecimal ATR_MULTIPLIER_STOP_LOSS = new BigDecimal("2.0");
     private static final BigDecimal ATR_MULTIPLIER_TAKE_PROFIT = new BigDecimal("3.0");
+    private static final BigDecimal ATR_MULTIPLIER_BREAKEVEN = new BigDecimal("1.0");
+    private static final BigDecimal MIN_PROFIT_TO_COMMISSION_RATIO = new BigDecimal("3.0");
     private static final BigDecimal ESTIMATED_COMMISSION_RATE = new BigDecimal("0.0005"); // 0.05%
-    private static final BigDecimal INITIAL_BALANCE = new BigDecimal("100000.00"); // Начальный баланс 100k руб
+    private static final BigDecimal INITIAL_BALANCE = new BigDecimal("10000.00"); // Начальный баланс 100k руб
+    private static final long COOLDOWN_MINUTES = 0; // Коулдаун после сделки
 
     private final TinkoffMarketDataService marketDataService;
     private final TechnicalIndicatorService indicatorService;
+    private final RiskManagementService riskManagementService;
+    private final TradingStateMachine stateMachine;
+    private final N8nSignalService n8nSignalService;
+    private final InvestApi api;
 
-    public BacktestEngine(TinkoffMarketDataService marketDataService, TechnicalIndicatorService indicatorService) {
+    public BacktestEngine(TinkoffMarketDataService marketDataService, 
+                         TechnicalIndicatorService indicatorService,
+                         RiskManagementService riskManagementService,
+                         TradingStateMachine stateMachine,
+                         N8nSignalService n8nSignalService) {
         this.marketDataService = marketDataService;
         this.indicatorService = indicatorService;
+        this.riskManagementService = riskManagementService;
+        this.stateMachine = stateMachine;
+        this.n8nSignalService = n8nSignalService;
+        this.api = TinkoffApi.getApi();
     }
 
     /**
@@ -130,49 +150,145 @@ public class BacktestEngine {
 
     /**
      * Запускает бэктест для указанного инструмента за период
+     * Торговля идет на свечах M15, индикаторы рассчитываются из H1 и M15
      *
      * @param figi FIGI инструмента
      * @param ticker Тикер инструмента
-     * @param days Количество дней для бэктеста
-     * @param interval Интервал свечей
+     * @param days Количество дней для бэктеста (максимум 10 для M15)
+     * @param interval Интервал свечей (должен быть M15 для торговли)
+     * @param sharedBalance Общий баланс для всех тикеров (null для отдельного баланса на тикер)
+     * @param atrMultiplierStopLoss Множитель ATR для стоп-лосса (null для значения по умолчанию)
+     * @param atrMultiplierTakeProfit Множитель ATR для тейк-профита (null для значения по умолчанию)
+     * @param atrMultiplierBreakeven Множитель ATR для безубытка (null для значения по умолчанию)
      * @return Результат бэктеста
      */
-    public BacktestResult runBacktest(String figi, String ticker, int days, CandleInterval interval) {
+    public BacktestResult runBacktest(String figi, String ticker, int days, CandleInterval interval, 
+                                     SharedBacktestBalance sharedBalance,
+                                     BigDecimal atrMultiplierStopLoss, 
+                                     BigDecimal atrMultiplierTakeProfit, 
+                                     BigDecimal atrMultiplierBreakeven) {
         logger.info("Запуск бэктеста для {} за {} дней", ticker, days);
         
-        Instant endDate = Instant.now();
-        List<HistoricCandle> candles = marketDataService.getHistoricCandles(figi, days, interval, endDate);
+        // Получаем информацию об инструменте
+        Instrument instrument;
+        try {
+            instrument = api.getInstrumentsService().getInstrumentByFigiSync(figi);
+        } catch (Exception e) {
+            logger.error("Ошибка получения инструмента: {}", e.getMessage());
+            return null;
+        }
         
-        if (candles.size() < 120) {
-            logger.warn("Недостаточно свечей для бэктеста: {}", candles.size());
+        // Ограничение: для M15 можно запросить максимум 10 дней
+        int daysM15 = Math.max(days, 10);
+        int daysH1 = Math.max(days, 30); // Для H1 нужно больше дней для расчета индикаторов
+        
+        Instant endDate = Instant.now();
+        
+        // Получаем свечи M15 (основной таймфрейм для торговли)
+        List<HistoricCandle> candlesM15 = marketDataService.getHistoricCandles(
+            figi, daysM15, CandleInterval.CANDLE_INTERVAL_15_MIN, endDate);
+        
+        if (candlesM15.size() < 120) {
+            logger.warn("Недостаточно M15 свечей для бэктеста: {} (требуется минимум 120)", candlesM15.size());
             return null;
         }
 
-        Instant startDate = Instant.ofEpochSecond(candles.get(0).getTime().getSeconds());
+        Instant startDate = Instant.ofEpochSecond(candlesM15.get(0).getTime().getSeconds());
         
-        BigDecimal balance = INITIAL_BALANCE;
-        BigDecimal peakBalance = INITIAL_BALANCE;
-        BigDecimal maxDrawdown = BigDecimal.ZERO;
-        BigDecimal maxDrawdownPercent = BigDecimal.ZERO;
+        // Используем переданные параметры или значения по умолчанию
+        BigDecimal stopLossMultiplier = atrMultiplierStopLoss != null ? atrMultiplierStopLoss : ATR_MULTIPLIER_STOP_LOSS;
+        BigDecimal takeProfitMultiplier = atrMultiplierTakeProfit != null ? atrMultiplierTakeProfit : ATR_MULTIPLIER_TAKE_PROFIT;
+        BigDecimal breakevenMultiplier = atrMultiplierBreakeven != null ? atrMultiplierBreakeven : ATR_MULTIPLIER_BREAKEVEN;
+        
+        // Используем общий баланс или создаем локальный для этого тикера
+        boolean useSharedBalance = sharedBalance != null;
+        
+        // Локальные переменные для отслеживания баланса этого тикера (для статистики)
+        BigDecimal tickerInitialBalance = useSharedBalance && sharedBalance != null 
+            ? sharedBalance.getAvailableBalance() 
+            : INITIAL_BALANCE;
+        BigDecimal tickerFinalBalance = tickerInitialBalance;
+        
+        // Локальные переменные для работы с балансом (если не используется общий)
+        BigDecimal availableBalance = useSharedBalance ? null : INITIAL_BALANCE;
+        BigDecimal lockedBalance = useSharedBalance ? null : BigDecimal.ZERO;
+        BigDecimal totalBalance = useSharedBalance ? null : INITIAL_BALANCE;
+        BigDecimal peakBalance = useSharedBalance ? null : INITIAL_BALANCE;
+        BigDecimal maxDrawdown = useSharedBalance ? null : BigDecimal.ZERO;
+        BigDecimal maxDrawdownPercent = useSharedBalance ? null : BigDecimal.ZERO;
         
         List<Trade> trades = new ArrayList<>();
         Position currentPosition = null;
+        Instant lastTradeTime = null; // Время последней сделки для коулдауна
         
-        // Проходим по свечам, начиная с индекса 120 (чтобы были индикаторы)
-        for (int i = 120; i < candles.size(); i++) {
-            List<HistoricCandle> historyCandles = candles.subList(0, i + 1);
-            Map<String, Double> indicators = indicatorService.calculateIndicators(historyCandles, ticker, figi);
-            
-            if (indicators.isEmpty()) {
-                continue;
-            }
-            
-            HistoricCandle currentCandle = candles.get(i);
+        // Сбрасываем состояние для этого тикера
+        stateMachine.resetToScanning(figi);
+        
+        // Получаем H1 свечи один раз за весь период (оптимизация)
+        List<HistoricCandle> allCandlesH1 = marketDataService.getHistoricCandles(
+            figi, daysH1, CandleInterval.CANDLE_INTERVAL_HOUR, endDate);
+        
+        if (allCandlesH1.size() < 120) {
+            logger.warn("Недостаточно H1 свечей для расчета индикаторов: {} (требуется минимум 120)", allCandlesH1.size());
+            return null;
+        }
+        
+        // Проходим по M15 свечам, начиная с индекса 120 (чтобы были индикаторы)
+        // Для каждой M15 свечи получаем актуальные H1 и M15 индикаторы
+        for (int i = 120; i < candlesM15.size(); i++) {
+            HistoricCandle currentCandle = candlesM15.get(i);
             BigDecimal currentPrice = TinkoffApiUtils.quotationToBigDecimal(currentCandle.getClose());
             Instant currentTime = Instant.ofEpochSecond(currentCandle.getTime().getSeconds());
             
-            // Если есть открытая позиция - проверяем SL/TP
+            // Фильтруем H1 свечи до текущего момента (для расчета H1 индикаторов)
+            List<HistoricCandle> candlesH1 = allCandlesH1.stream()
+                .filter(c -> {
+                    Instant candleTime = Instant.ofEpochSecond(c.getTime().getSeconds());
+                    return !candleTime.isAfter(currentTime);
+                })
+                .toList();
+            
+            if (candlesH1.size() < 120) {
+                continue;
+            }
+            
+            // Рассчитываем H1 индикаторы
+            Map<String, Double> indicatorsH1 = indicatorService.calculateIndicators(candlesH1, ticker, figi);
+            
+            if (indicatorsH1.isEmpty()) {
+                continue;
+            }
+            
+            // Получаем M15 свечи до текущего момента (для расчета M15 индикаторов)
+            List<HistoricCandle> candlesM15ForIndicators = candlesM15.subList(0, i + 1);
+            
+            if (candlesM15ForIndicators.size() < 120) {
+                continue;
+            }
+            
+            // Рассчитываем M15 индикаторы
+            Map<String, Double> indicatorsM15 = indicatorService.calculateIndicators(candlesM15ForIndicators, ticker, figi);
+            
+            if (indicatorsM15.isEmpty()) {
+                continue;
+            }
+            
+            // Если есть открытая позиция - проверяем SL/TP и трейлинг стоп
+            // Пропускаем проверку canTrade() для инструментов с открытыми позициями
             if (currentPosition != null) {
+                // Проверяем, что состояние ACTIVE (позиция открыта)
+                TradingStateMachine.TradingStateType state = stateMachine.getState(figi);
+                if (state != TradingStateMachine.TradingStateType.ACTIVE) {
+                    // Состояние не соответствует - сбрасываем позицию
+                    logger.warn("Несоответствие состояния для {}: позиция открыта, но состояние {}", figi, state);
+                    currentPosition = null;
+                    stateMachine.resetToScanning(figi);
+                    continue;
+                }
+                // Обновляем трейлинг стоп с безубытком (используем H1 индикаторы для ATR)
+                updateTrailingStop(currentPosition, currentPrice, indicatorsH1, instrument, 
+                                  stopLossMultiplier, breakevenMultiplier);
+                
                 // Проверка стоп-лосса и тейк-профита
                 boolean shouldExit = false;
                 String exitReason = "";
@@ -199,105 +315,274 @@ public class BacktestEngine {
                 
                 if (shouldExit) {
                     // Закрываем позицию
-                    BigDecimal exitPnL = calculateFinalPnL(currentPosition, currentPrice);
-                    balance = balance.add(exitPnL);
+                    // В реальной торговле: возвращаем заблокированные средства + PnL - комиссия за выход
+                    BigDecimal quantity = BigDecimal.valueOf(currentPosition.lots * instrument.getLot());
+                    BigDecimal entryValue = currentPosition.entryPrice.multiply(quantity); // БЕЗ комиссии за вход
+                    BigDecimal exitValue = currentPrice.multiply(quantity);
                     
-                    BigDecimal pnlPercent = exitPnL.divide(
-                        currentPosition.entryPrice.multiply(currentPosition.quantity), 
-                        4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
+                    // Gross PnL (без учета комиссий)
+                    BigDecimal grossPnL = currentPosition.isLong 
+                        ? exitValue.subtract(entryValue)
+                        : entryValue.subtract(exitValue);
+                    
+                    // Комиссия за выход
+                    BigDecimal exitCommission = exitValue.multiply(ESTIMATED_COMMISSION_RATE);
+                    
+                    // Net PnL (с учетом комиссии за выход)
+                    // Комиссия за вход уже была вычтена при открытии из availableBalance
+                    BigDecimal netPnL = grossPnL.subtract(exitCommission);
+                    
+                    // Возвращаем заблокированные средства + Net PnL
+                    // lockedBalance = entryValue (без комиссии)
+                    // netPnL уже учитывает комиссию за выход
+                    if (useSharedBalance && sharedBalance != null) {
+                        sharedBalance.closePosition(entryValue, netPnL);
+                    } else if (availableBalance != null && lockedBalance != null) {
+                        availableBalance = availableBalance.add(lockedBalance).add(netPnL);
+                        lockedBalance = BigDecimal.ZERO;
+                        totalBalance = availableBalance;
+                    }
+                    
+                    // Для расчета процента используем стоимость входа + комиссия за вход
+                    BigDecimal entryValueWithCommission = entryValue.multiply(
+                        BigDecimal.ONE.add(ESTIMATED_COMMISSION_RATE));
+                    BigDecimal pnlPercent = netPnL.divide(entryValueWithCommission, 4, RoundingMode.HALF_UP)
+                        .multiply(BigDecimal.valueOf(100));
+                    
+                    boolean wasLoss = netPnL.compareTo(BigDecimal.ZERO) < 0;
                     
                     trades.add(new Trade(
                         currentPosition.entryTime,
                         currentTime,
                         currentPosition.entryPrice,
                         currentPrice,
-                        currentPosition.quantity,
-                        exitPnL,
+                        quantity,
+                        netPnL,
                         pnlPercent,
                         exitReason
                     ));
                     
+                    // STATE MACHINE: Переход в COOLDOWN
+                    stateMachine.setCooldown(figi, wasLoss);
+                    lastTradeTime = currentTime;
                     currentPosition = null;
+                } else {
+                    // Обновляем общий баланс с учетом текущего unrealized PnL
+                    BigDecimal quantity = BigDecimal.valueOf(currentPosition.lots * instrument.getLot());
+                    BigDecimal entryValue = currentPosition.entryPrice.multiply(quantity);
+                    BigDecimal currentValue = currentPrice.multiply(quantity);
+                    
+                    BigDecimal unrealizedPnL = currentPosition.isLong
+                        ? currentValue.subtract(entryValue)
+                        : entryValue.subtract(currentValue);
+                    
+                    // Общий баланс = свободные + заблокированные + unrealized PnL
+                    if (useSharedBalance && sharedBalance != null) {
+                        sharedBalance.updateUnrealizedPnL(entryValue, unrealizedPnL);
+                    } else if (availableBalance != null && lockedBalance != null) {
+                        totalBalance = availableBalance.add(lockedBalance).add(unrealizedPnL);
+                    }
                 }
             } else {
-                // Нет позиции - ищем точку входа
-                double adx = indicators.getOrDefault("adx_14", 0.0);
-                double rsi = indicators.getOrDefault("rsi_14", 50.0);
-                double macdHist = indicators.getOrDefault("macd_hist", 0.0);
-                double macdHistPrev = indicators.getOrDefault("macd_hist_previous", 0.0);
-                double ema100 = indicators.getOrDefault("ema_100", 0.0);
-                double atr = indicators.getOrDefault("atr_14", 0.0);
+                // Нет позиции - проверяем состояние и ищем точку входа
+                TradingStateMachine.TradingStateType state = stateMachine.getState(figi);
                 
-                // Фильтр ADX
-                if (adx < MIN_ADX_THRESHOLD) {
+                // Если состояние ACTIVE или ENTRY_PENDING, но позиции нет - сбрасываем состояние
+                if (state == TradingStateMachine.TradingStateType.ACTIVE || 
+                    state == TradingStateMachine.TradingStateType.ENTRY_PENDING ||
+                    state == TradingStateMachine.TradingStateType.EXIT_PENDING) {
+                    logger.warn("Несоответствие: позиции нет, но состояние {} для {}. Сбрасываем в SCANNING.", state, figi);
+                    stateMachine.resetToScanning(figi);
+                    state = TradingStateMachine.TradingStateType.SCANNING;
+                }
+                
+                // Проверяем коулдаун
+                if (state == TradingStateMachine.TradingStateType.COOLDOWN) {
+                    if (lastTradeTime != null) {
+                        long minutesSinceTrade = ChronoUnit.MINUTES.between(lastTradeTime, currentTime);
+                        if (minutesSinceTrade < COOLDOWN_MINUTES) {
+                            continue; // Все еще в коулдауне
+                        }
+                    }
+                    // Коулдаун истек, состояние автоматически обновлено в stateMachine.getState()
+                    // Обновляем переменную state для дальнейших проверок
+                    state = stateMachine.getState(figi);
+                    // После истечения коулдауна состояние должно быть SCANNING
+                    if (state != TradingStateMachine.TradingStateType.SCANNING) {
+                        logger.warn("После истечения коулдауна состояние {} для {} не SCANNING. Принудительно сбрасываем.", state, figi);
+                        stateMachine.resetToScanning(figi);
+                        state = TradingStateMachine.TradingStateType.SCANNING;
+                    }
+                }
+                
+                // Проверяем, можно ли торговать (должно быть SCANNING)
+                if (!stateMachine.canTrade(figi)) {
+                    // Если не можем торговать, пропускаем эту итерацию
+                    // Это может быть если состояние еще не SCANNING (например, после истечения коулдауна)
                     continue;
                 }
                 
-                // Простая стратегия: BUY если цена выше EMA100, MACD положительный и растет
-                boolean buySignal = currentPrice.compareTo(BigDecimal.valueOf(ema100)) > 0 
-                        && macdHist > 0 
-                        && macdHist > macdHistPrev
-                        && rsi < 70; // Не перекуплен
+                // Используем N8nSignalService для генерации сигнала
+                // В бэктесте order_book и news не учитываются (null)
+                TradeRequest tradeRequest = n8nSignalService.generateTradeSignal(
+                    figi, ticker, indicatorsH1, indicatorsM15, null, null, currentPrice.doubleValue());
                 
-                if (buySignal && balance.compareTo(BigDecimal.valueOf(10000)) > 0) {
-                    // Открываем LONG позицию
-                    BigDecimal tradeAmount = balance.multiply(BigDecimal.valueOf(0.1)); // 10% баланса
-                    BigDecimal quantity = tradeAmount.divide(currentPrice, 2, RoundingMode.FLOOR);
+                // Проверяем, можно ли исполнять сигнал (confidence_score >= 0.8)
+                if (!n8nSignalService.canExecuteSignal(tradeRequest)) {
+                    continue;
+                }
+                
+                String action = tradeRequest.getAction();
+                if ("BUY".equalsIgnoreCase(action) || "SELL".equalsIgnoreCase(action)) {
+                    // STATE MACHINE: Переход в ENTRY_PENDING
+                    stateMachine.setEntryPending(figi, "backtest_" + currentTime.toEpochMilli());
                     
-                    if (quantity.compareTo(BigDecimal.ZERO) > 0) {
-                        BigDecimal stopLoss = currentPrice.subtract(
-                            BigDecimal.valueOf(atr).multiply(ATR_MULTIPLIER_STOP_LOSS));
-                        BigDecimal takeProfit = currentPrice.add(
-                            BigDecimal.valueOf(atr).multiply(ATR_MULTIPLIER_TAKE_PROFIT));
-                        
-                        currentPosition = new Position(
-                            currentTime,
-                            currentPrice,
-                            quantity,
-                            stopLoss,
-                            takeProfit,
-                            true
-                        );
-                        
-                        // Вычитаем комиссию
-                        BigDecimal commission = tradeAmount.multiply(ESTIMATED_COMMISSION_RATE);
-                        balance = balance.subtract(commission);
+                    // Рассчитываем стоп-лосс и тейк-профит
+                    double atr = indicatorsH1.getOrDefault("atr_14", 0.0);
+                    if (atr == 0.0) {
+                        stateMachine.resetToScanning(figi);
+                        continue;
                     }
+                    
+                    BigDecimal stopLossOffset = BigDecimal.valueOf(atr).multiply(stopLossMultiplier);
+                    BigDecimal takeProfitOffset = BigDecimal.valueOf(atr).multiply(takeProfitMultiplier);
+                    
+                    boolean isLong = "BUY".equalsIgnoreCase(action);
+                    BigDecimal stopLossPrice = isLong 
+                        ? currentPrice.subtract(stopLossOffset)
+                        : currentPrice.add(stopLossOffset);
+                    BigDecimal takeProfitPrice = isLong
+                        ? currentPrice.add(takeProfitOffset)
+                        : currentPrice.subtract(takeProfitOffset);
+                    
+                    // Используем RiskManagementService для расчета размера позиции
+                    BigDecimal currentAvailableBalance = (useSharedBalance && sharedBalance != null)
+                        ? sharedBalance.getAvailableBalance() 
+                        : (availableBalance != null ? availableBalance : INITIAL_BALANCE);
+                    long lotsToTrade = riskManagementService.calculateSafeLotSize(
+                        currentAvailableBalance, currentPrice, stopLossPrice, instrument);
+                    
+                    if (lotsToTrade == 0) {
+                        stateMachine.resetToScanning(figi);
+                        continue;
+                    }
+                    
+                    // ПРОВЕРКА ЭКОНОМИКИ (как в реальной торговле)
+                    if (!isEconomicallyViable(ticker, currentPrice, takeProfitPrice, lotsToTrade, instrument.getLot())) {
+                        stateMachine.resetToScanning(figi);
+                        continue;
+                    }
+                    
+                    // Проверка достаточности средств
+                    BigDecimal tradeAmount = currentPrice.multiply(BigDecimal.valueOf(lotsToTrade * instrument.getLot()));
+                    BigDecimal entryCommission = tradeAmount.multiply(ESTIMATED_COMMISSION_RATE);
+                    
+                    if (useSharedBalance && sharedBalance != null) {
+                        // Используем синхронизированный общий баланс
+                        if (!sharedBalance.openPosition(tradeAmount, entryCommission)) {
+                            stateMachine.resetToScanning(figi);
+                            continue; // Недостаточно средств
+                        }
+                    } else if (availableBalance != null && lockedBalance != null) {
+                        // Локальный баланс для этого тикера
+                        if (availableBalance.compareTo(tradeAmount.add(entryCommission)) < 0) {
+                            stateMachine.resetToScanning(figi);
+                            continue;
+                        }
+                        availableBalance = availableBalance.subtract(tradeAmount).subtract(entryCommission);
+                        lockedBalance = lockedBalance.add(tradeAmount);
+                        if (totalBalance != null) {
+                            totalBalance = availableBalance.add(lockedBalance);
+                        }
+                    }
+                    
+                    // Открываем позицию
+                    BigDecimal minPriceIncrement = TinkoffApiUtils.quotationToBigDecimal(instrument.getMinPriceIncrement());
+                    BigDecimal roundedSl = TinkoffApiUtils.roundToStep(stopLossPrice, minPriceIncrement);
+                    BigDecimal roundedTp = TinkoffApiUtils.roundToStep(takeProfitPrice, minPriceIncrement);
+                    
+                    // В реальной торговле:
+                    // - Средства блокируются (но остаются в балансе как заблокированные)
+                    // - Комиссия за вход вычитается брокером автоматически при исполнении из availableBalance
+                    // - entryPrice - это средняя цена входа БЕЗ комиссии (как в брокерском API)
+                    // Для бэктеста используем цену закрытия свечи как цену исполнения
+                    BigDecimal executionPrice = currentPrice; // В реальности может быть проскальзывание
+                    
+                    currentPosition = new Position(
+                        currentTime,
+                        executionPrice, // Цена входа БЕЗ комиссии (как в брокерском API)
+                        lotsToTrade,
+                        roundedSl,
+                        roundedTp,
+                        isLong
+                    );
+                    
+                    // STATE MACHINE: Переход в ACTIVE
+                    stateMachine.setActive(figi);
                 }
             }
             
-            // Обновляем пик и просадку
-            if (balance.compareTo(peakBalance) > 0) {
-                peakBalance = balance;
-            }
-            BigDecimal drawdown = peakBalance.subtract(balance);
-            if (drawdown.compareTo(maxDrawdown) > 0) {
-                maxDrawdown = drawdown;
-                maxDrawdownPercent = drawdown.divide(peakBalance, 4, RoundingMode.HALF_UP)
-                        .multiply(BigDecimal.valueOf(100));
+            // Обновляем пик и просадку на основе общего баланса (только для локального баланса)
+            if (!useSharedBalance && totalBalance != null && peakBalance != null && maxDrawdown != null) {
+                if (totalBalance.compareTo(peakBalance) > 0) {
+                    peakBalance = totalBalance;
+                }
+                BigDecimal drawdown = peakBalance.subtract(totalBalance);
+                if (drawdown.compareTo(maxDrawdown) > 0) {
+                    maxDrawdown = drawdown;
+                    if (maxDrawdownPercent != null && peakBalance.compareTo(BigDecimal.ZERO) > 0) {
+                        maxDrawdownPercent = drawdown.divide(peakBalance, 4, RoundingMode.HALF_UP)
+                                .multiply(BigDecimal.valueOf(100));
+                    }
+                }
             }
         }
         
         // Закрываем последнюю позицию, если есть
         if (currentPosition != null) {
-            HistoricCandle lastCandle = candles.get(candles.size() - 1);
+            HistoricCandle lastCandle = candlesM15.get(candlesM15.size() - 1);
             BigDecimal lastPrice = TinkoffApiUtils.quotationToBigDecimal(lastCandle.getClose());
             Instant lastTime = Instant.ofEpochSecond(lastCandle.getTime().getSeconds());
             
-            BigDecimal exitPnL = calculateFinalPnL(currentPosition, lastPrice);
-            balance = balance.add(exitPnL);
+            BigDecimal quantity = BigDecimal.valueOf(currentPosition.lots * instrument.getLot());
+            BigDecimal entryValue = currentPosition.entryPrice.multiply(quantity); // БЕЗ комиссии за вход
+            BigDecimal exitValue = lastPrice.multiply(quantity);
             
-            BigDecimal pnlPercent = exitPnL.divide(
-                currentPosition.entryPrice.multiply(currentPosition.quantity), 
-                4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
+            // Gross PnL
+            BigDecimal grossPnL = currentPosition.isLong
+                ? exitValue.subtract(entryValue)
+                : entryValue.subtract(exitValue);
+            
+            // Комиссия за выход
+            BigDecimal exitCommission = exitValue.multiply(ESTIMATED_COMMISSION_RATE);
+            
+            // Net PnL (комиссия за вход уже вычтена при открытии)
+            BigDecimal netPnL = grossPnL.subtract(exitCommission);
+            
+            // Возвращаем заблокированные средства + PnL
+            if (useSharedBalance && sharedBalance != null) {
+                sharedBalance.closePosition(entryValue, netPnL);
+            } else if (availableBalance != null && lockedBalance != null) {
+                availableBalance = availableBalance.add(lockedBalance).add(netPnL);
+                lockedBalance = BigDecimal.ZERO;
+                if (totalBalance != null) {
+                    totalBalance = availableBalance;
+                }
+            }
+            
+            // Для расчета процента используем стоимость входа + комиссия за вход
+            BigDecimal entryValueWithCommission = entryValue.multiply(
+                BigDecimal.ONE.add(ESTIMATED_COMMISSION_RATE));
+            BigDecimal pnlPercent = netPnL.divide(entryValueWithCommission, 4, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100));
             
             trades.add(new Trade(
                 currentPosition.entryTime,
                 lastTime,
                 currentPosition.entryPrice,
                 lastPrice,
-                currentPosition.quantity,
-                exitPnL,
+                quantity,
+                netPnL,
                 pnlPercent,
                 "END_OF_PERIOD"
             ));
@@ -314,49 +599,140 @@ public class BacktestEngine {
             }
         }
         
+        // Получаем финальные значения баланса
+        BigDecimal finalMaxDrawdown;
+        BigDecimal finalMaxDrawdownPercent;
+        
+        if (useSharedBalance && sharedBalance != null) {
+            tickerFinalBalance = sharedBalance.getTotalBalance();
+            finalMaxDrawdown = sharedBalance.getMaxDrawdown();
+            finalMaxDrawdownPercent = sharedBalance.getMaxDrawdownPercent();
+        } else {
+            tickerFinalBalance = totalBalance != null ? totalBalance : tickerInitialBalance;
+            finalMaxDrawdown = maxDrawdown != null ? maxDrawdown : BigDecimal.ZERO;
+            finalMaxDrawdownPercent = maxDrawdownPercent != null ? maxDrawdownPercent : BigDecimal.ZERO;
+        }
+        
         return new BacktestResult(
             ticker,
             startDate,
             endDate,
-            INITIAL_BALANCE,
-            balance,
+            tickerInitialBalance,
+            tickerFinalBalance,
             trades.size(),
             winningTrades,
             losingTrades,
-            maxDrawdown,
-            maxDrawdownPercent,
+            finalMaxDrawdown,
+            finalMaxDrawdownPercent,
             trades
         );
     }
     
-    private BigDecimal calculatePnL(Position position, BigDecimal currentPrice) {
-        if (position.isLong) {
-            return currentPrice.subtract(position.entryPrice).multiply(position.quantity);
-        } else {
-            return position.entryPrice.subtract(currentPrice).multiply(position.quantity);
+    /**
+     * ПРОВЕРКА РЕНТАБЕЛЬНОСТИ (как в TinkoffOrderService)
+     * Возвращает false, если комиссия съест прибыль.
+     */
+    private boolean isEconomicallyViable(String ticker, BigDecimal entryPrice, BigDecimal takeProfitPrice, long lots, int lotSize) {
+        if (lots == 0) return false;
+
+        BigDecimal volume = entryPrice.multiply(BigDecimal.valueOf(lots * lotSize));
+        // Комиссия за круг (вход + выход)
+        BigDecimal totalCommission = volume.multiply(ESTIMATED_COMMISSION_RATE).multiply(BigDecimal.valueOf(2));
+
+        // Потенциал движения (грязная прибыль)
+        BigDecimal potentialProfit = takeProfitPrice.subtract(entryPrice).abs().multiply(BigDecimal.valueOf(lots * lotSize));
+        // Чистая прибыль (прогноз)
+        BigDecimal netProfit = potentialProfit.subtract(totalCommission);
+
+        // Соотношение Прибыль / Комиссия
+        BigDecimal ratio = (totalCommission.compareTo(BigDecimal.ZERO) == 0) 
+            ? BigDecimal.valueOf(100) 
+            : potentialProfit.divide(totalCommission, 2, RoundingMode.HALF_UP);
+
+        if (ratio.compareTo(MIN_PROFIT_TO_COMMISSION_RATIO) < 0) {
+            return false;
         }
+
+        if (netProfit.compareTo(BigDecimal.ZERO) <= 0) {
+            return false;
+        }
+
+        return true;
     }
     
-    private BigDecimal calculateFinalPnL(Position position, BigDecimal exitPrice) {
-        BigDecimal grossPnL = calculatePnL(position, exitPrice);
-        BigDecimal tradeValue = position.entryPrice.multiply(position.quantity);
-        BigDecimal commission = tradeValue.multiply(ESTIMATED_COMMISSION_RATE).multiply(BigDecimal.valueOf(2)); // Вход + выход
-        return grossPnL.subtract(commission);
+    /**
+     * Обновляет трейлинг стоп с безубытком (как в TinkoffOrderService)
+     */
+    private void updateTrailingStop(Position position, BigDecimal currentPrice, 
+                                    Map<String, Double> indicators, Instrument instrument,
+                                    BigDecimal stopLossMultiplier, BigDecimal breakevenMultiplier) {
+        double atrValue = indicators.getOrDefault("atr_14", 0.0);
+        if (atrValue == 0.0) return;
+        
+        BigDecimal minPriceIncrement = TinkoffApiUtils.quotationToBigDecimal(instrument.getMinPriceIncrement());
+        BigDecimal atrMultiplier = BigDecimal.valueOf(atrValue).multiply(breakevenMultiplier);
+        
+        if (position.isLong) {
+            BigDecimal priceGain = currentPrice.subtract(position.entryPrice);
+            
+            // Если цена ушла в плюс на breakevenMultiplier * ATR, переносим стоп в безубыток
+            if (priceGain.compareTo(atrMultiplier) >= 0) {
+                BigDecimal breakevenStop = position.entryPrice.add(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                BigDecimal roundedBreakeven = TinkoffApiUtils.roundToStep(breakevenStop, minPriceIncrement);
+                
+                if (roundedBreakeven.compareTo(position.stopLoss) > 0) {
+                    position.stopLoss = roundedBreakeven;
+                }
+            } else {
+                // Обычный трейлинг: стоп на stopLossMultiplier * ATR от текущей цены
+                BigDecimal newStopLossPrice = currentPrice.subtract(BigDecimal.valueOf(atrValue).multiply(stopLossMultiplier));
+                BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
+                
+                // Обновляем только если новый стоп выше старого и выше безубытка
+                BigDecimal minStop = position.entryPrice.add(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                if (roundedNewSl.compareTo(minStop) > 0 && roundedNewSl.compareTo(position.stopLoss) > 0) {
+                    position.stopLoss = roundedNewSl;
+                }
+            }
+        } else {
+            // SHORT позиция
+            BigDecimal priceGain = position.entryPrice.subtract(currentPrice);
+            
+            // Если цена ушла в плюс на breakevenMultiplier * ATR, переносим стоп в безубыток
+            if (priceGain.compareTo(atrMultiplier) >= 0) {
+                BigDecimal breakevenStop = position.entryPrice.subtract(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                BigDecimal roundedBreakeven = TinkoffApiUtils.roundToStep(breakevenStop, minPriceIncrement);
+                
+                if (roundedBreakeven.compareTo(position.stopLoss) < 0) {
+                    position.stopLoss = roundedBreakeven;
+                }
+            } else {
+                // Обычный трейлинг: стоп на stopLossMultiplier * ATR от текущей цены
+                BigDecimal newStopLossPrice = currentPrice.add(BigDecimal.valueOf(atrValue).multiply(stopLossMultiplier));
+                BigDecimal roundedNewSl = TinkoffApiUtils.roundToStep(newStopLossPrice, minPriceIncrement);
+                
+                // Обновляем только если новый стоп ниже старого и ниже безубытка
+                BigDecimal maxStop = position.entryPrice.subtract(minPriceIncrement.multiply(BigDecimal.valueOf(5)));
+                if (roundedNewSl.compareTo(maxStop) < 0 && roundedNewSl.compareTo(position.stopLoss) < 0) {
+                    position.stopLoss = roundedNewSl;
+                }
+            }
+        }
     }
     
     private static class Position {
         final Instant entryTime;
         final BigDecimal entryPrice;
-        final BigDecimal quantity;
-        final BigDecimal stopLoss;
+        final long lots;
+        BigDecimal stopLoss; // Изменяемый для трейлинга
         final BigDecimal takeProfit;
         final boolean isLong;
         
-        Position(Instant entryTime, BigDecimal entryPrice, BigDecimal quantity,
+        Position(Instant entryTime, BigDecimal entryPrice, long lots,
                 BigDecimal stopLoss, BigDecimal takeProfit, boolean isLong) {
             this.entryTime = entryTime;
             this.entryPrice = entryPrice;
-            this.quantity = quantity;
+            this.lots = lots;
             this.stopLoss = stopLoss;
             this.takeProfit = takeProfit;
             this.isLong = isLong;
