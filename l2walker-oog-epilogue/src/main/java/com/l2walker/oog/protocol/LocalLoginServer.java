@@ -86,6 +86,12 @@ public final class LocalLoginServer implements AutoCloseable {
 			byte[] init = EpiloguePackets.init(sessionId, rsa.scrambledModulus(), blowfishKey);
 			TcpFrames.send(out, crypt.encryptInitial(init, sessionId));
 
+			int guardSession = EpiloguePackets.parseAuthGameGuard(crypt.decrypt(TcpFrames.recv(in)));
+			if (guardSession != sessionId) {
+				throw new IllegalStateException("AuthGameGuard session id mismatch");
+			}
+			TcpFrames.send(out, crypt.encrypt(EpiloguePackets.ggAuth(sessionId)));
+
 			EpiloguePackets.AuthFrame auth = EpiloguePackets.parseAuthLogin(crypt.decrypt(TcpFrames.recv(in)));
 			if (auth.sessionId() != sessionId) {
 				throw new IllegalStateException("client echoed a different login session id");

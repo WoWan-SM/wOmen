@@ -14,8 +14,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * OOG login client for Gracia Epilogue private servers that speak the L2J login handshake
- * and protocol version 152 on the game server.
+ * OOG login client. Outgoing packets follow the Gracia Epilogue client field order.
  */
 public final class LoginClient152 {
 
@@ -40,6 +39,11 @@ public final class LoginClient152 {
 
 			LoginCrypt crypt = new LoginCrypt();
 			crypt.setKey(init.blowfishKey());
+			TcpFrames.send(out, crypt.encrypt(EpiloguePackets.authGameGuard(init.sessionId())));
+			int guardResponse = EpiloguePackets.parseGgAuth(crypt.decrypt(TcpFrames.recv(in)));
+			if (guardResponse != init.sessionId()) {
+				throw new IllegalStateException("GGAuth did not echo the login session id");
+			}
 			TcpFrames.send(out, crypt.encrypt(EpiloguePackets.requestAuthLogin(rsa, init.sessionId())));
 
 			EpiloguePackets.SessionPair loginOk = EpiloguePackets.parseLoginOk(crypt.decrypt(TcpFrames.recv(in)));

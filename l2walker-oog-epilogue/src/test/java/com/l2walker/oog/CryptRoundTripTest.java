@@ -87,6 +87,11 @@ class CryptRoundTripTest {
 		}
 		assertArrayEquals(modulus, RsaLoginKey.unscramble(RsaLoginKey.scramble(modulus)));
 
+		byte[] block = RsaLoginKey.credentialBlock("epilogue", "secret");
+		assertEquals(0x24, block[0x5b] & 0xff);
+		assertEquals((byte) 'e', block[0x5e]);
+		assertEquals((byte) 's', block[0x6c]);
+
 		RsaLoginKey key = RsaLoginKey.generate();
 		byte[] sealed = RsaLoginKey.sealCredentials(RsaLoginKey.publicKeyFromScrambled(key.scrambledModulus()), "epilogue", "secret");
 		String[] opened = key.openCredentials(sealed);

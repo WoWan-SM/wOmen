@@ -14,8 +14,8 @@ import java.util.Arrays;
 
 /**
  * 1024-bit RSA used by the Gracia Epilogue login handshake.
- * The server sends a scrambled modulus; credentials sit at the classic L2J offsets
- * (account at {@code 0x5E}, password at {@code 0x6C}) inside a raw 128-byte block.
+ * The official client writes a raw 128-byte block: marker {@code 0x24} at {@code 0x5B},
+ * account at {@code 0x5E} (14 bytes), password at {@code 0x6C} (16 bytes).
  */
 public final class RsaLoginKey {
 
@@ -65,10 +65,17 @@ public final class RsaLoginKey {
 		}
 	}
 
-	public static byte[] sealCredentials(PublicKey key, String account, String password) {
+	/** Plaintext block the client encrypts. {@code block[0x5B] == 0x24}. */
+	public static byte[] credentialBlock(String account, String password) {
 		byte[] block = new byte[128];
+		block[0x5B] = 0x24;
 		writeAscii(block, 0x5E, account, 14);
 		writeAscii(block, 0x6C, password, 16);
+		return block;
+	}
+
+	public static byte[] sealCredentials(PublicKey key, String account, String password) {
+		byte[] block = credentialBlock(account, password);
 		try {
 			Cipher cipher = Cipher.getInstance("RSA/ECB/NoPadding");
 			cipher.init(Cipher.ENCRYPT_MODE, key);

@@ -49,14 +49,17 @@ See `config/set.ini.example`. Key fields:
 
 ## Handshake
 
-`LoginClient152` speaks an L2J-style Gracia Epilogue OOG login:
+`LoginClient152` sends packets in the official client field order (no Epilogue client binary is bundled):
 
-1. Decrypt `Init` with the static Blowfish key and XOR-pass.
-2. Unscramble the RSA modulus and seal credentials (account at `0x5E`, password at `0x6C`).
-3. `LoginOk` → server list → `PlayOk`.
-4. Connect to the game server, read the plaintext key packet (`0x2E`), enable the XOR cipher.
-5. Send protocol version **152** (`0x0E`) and game `AuthLogin` (`0x2B`).
-6. Read `CharSelectionInfo` (`0x09`) count. A full paperdoll block is not parsed yet.
+1. Decrypt `Init` (client parser: session, revision, 128-byte modulus, 16-byte guard, 16-byte Blowfish key). The Blowfish body is 184 bytes so the TCP frame is 186, which that parser requires.
+2. Send `AuthGameGuard` (`0x07`), read `GGAuth` (`0x0B`).
+3. `RequestAuthLogin`: RSA block with marker `0x24` at `0x5B`, account at `0x5E`, password at `0x6C`, then the client's guard block and footer.
+4. `LoginOk` → `RequestServerList` (7-byte tail + 16 zeros) → server list (IP as a dword) → `RequestServerLogin` (22 zero bytes) → `PlayOk`.
+5. Game `ProtocolVersion` (`0x0E`): `152`, 256-byte fixed block, Epilogue trailer `A6 23 F4 FE`.
+6. Game `AuthLogin` (`0x2B`): name, four session dwords, trailing dword.
+7. `CharSelectionInfo` (`0x09`) starts with count, max slots, and a flag byte.
+
+`./gradlew test` covers the crypt primitives, these field widths, and a loopback handshake.
 
 `./gradlew test` covers the crypt primitives and a loopback client/server handshake. That harness uses the same packet builders as the client, so it proves the pipeline runs; it is not a capture from a third-party L2J process.
 
