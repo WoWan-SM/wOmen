@@ -1,0 +1,23 @@
+; Gracia Epilogue (protocol 152) — example OOG-style config
+; Copy to set.ini and edit for your private server.
+
+ProtocolVersion=152
+LoginServerIP=127.0.0.1
+LoginServerPort=2106
+GameServerIP=
+GameServerPort=7777
+
+OOG=1
+Official=0
+
+Account=bot_account
+Password=change_me
+
+; World id inside the login server list
+ServerId=1
+
+; Optional character slot (0-based), server-specific
+CharacterSlot=0
+
+; Logging
+LogLevel=INFO
