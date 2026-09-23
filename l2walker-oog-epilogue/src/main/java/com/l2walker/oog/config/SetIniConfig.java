@@ -21,7 +21,8 @@ public record SetIniConfig(
 		String account,
 		String password,
 		int characterSlot,
-		String logLevel
+		String logLevel,
+		int serverId
 ) {
 
 	public static final int GRACIA_EPILOGUE_PROTOCOL = 152;
@@ -53,7 +54,8 @@ public record SetIniConfig(
 				values.getOrDefault("account", ""),
 				values.getOrDefault("password", ""),
 				parseInt(values, "characterslot", 0),
-				values.getOrDefault("loglevel", "INFO")
+				values.getOrDefault("loglevel", "INFO"),
+				parseInt(values, "serverid", 1)
 		);
 	}
 

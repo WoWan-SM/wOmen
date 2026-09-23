@@ -16,7 +16,19 @@ cd l2walker-oog-epilogue
 ./gradlew build
 ```
 
-Run (loads `config/set.ini` by default):
+Local handshake (loopback login + game servers, no private shard required):
+
+```bash
+./gradlew run --args="--demo"
+```
+
+Dry run (validate `config/set.ini.example`, do not connect):
+
+```bash
+./gradlew run
+```
+
+Connect to a private server:
 
 ```bash
 ./gradlew run --args="config/set.ini"
@@ -32,11 +44,21 @@ See `config/set.ini.example`. Key fields:
 | `LoginServerIP` | `127.0.0.1` | Your login server host |
 | `LoginServerPort` | `2106` | Default L2 login port |
 | `OOG` | `1` | Out-of-game mode flag (convention from classic bot configs) |
-| `Account` / `Password` | — | Test account on **your** server only |
+| `ServerId` | `1` | World id to select from the login server list |
+| `Account` / `Password` | — | Test account on **your** server only. Account max 14 ASCII chars, password max 16 |
 
-## Protocol stub
+## Handshake
 
-`LoginProtocol152` documents the high-level OOG login steps and validates config. Network I/O is intentionally stubbed until you wire Blowfish/XOR handling for your fork.
+`LoginClient152` speaks an L2J-style Gracia Epilogue OOG login:
+
+1. Decrypt `Init` with the static Blowfish key and XOR-pass.
+2. Unscramble the RSA modulus and seal credentials (account at `0x5E`, password at `0x6C`).
+3. `LoginOk` → server list → `PlayOk`.
+4. Connect to the game server, read the plaintext key packet (`0x2E`), enable the XOR cipher.
+5. Send protocol version **152** (`0x0E`) and game `AuthLogin` (`0x2B`).
+6. Read `CharSelectionInfo` (`0x09`) count. A full paperdoll block is not parsed yet.
+
+`./gradlew test` covers the crypt primitives and a loopback client/server handshake. That harness uses the same packet builders as the client, so it proves the pipeline runs; it is not a capture from a third-party L2J process.
 
 ## Related open-source projects (reference only)
 
